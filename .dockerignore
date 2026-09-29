@@ -5,6 +5,10 @@ node_modules
 coverage
 *.log
 *.secret
+*.token
 *.session
+command-journal.json
 auth.json
 master.key
+__pycache__
+*.pyc

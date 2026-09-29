@@ -31,6 +31,16 @@ access details in an issue.
 - Keep Node on loopback behind HTTPS. The service has no public user signup:
   after the one-time owner setup, everyone else must deploy a separate
   instance.
+- The optional Kugou bridge uses a separate device Bearer token loaded only
+  from `KUGOU_DEVICE_TOKEN_FILE`. Never put its value in Git, `.env`, URLs,
+  command lines or logs. Restrict the token file to the service account on the
+  server and the current user on Windows.
+- Device tokens authorize only `/agent/v1`; OAuth and Personal Access Tokens
+  authorize only owner-facing MCP and `/api/v1`. MuMu ADB remains local to the
+  Windows host and must never be exposed publicly.
+- The Windows command journal is stored under `%LOCALAPPDATA%\music-bridge`.
+  Back it up only if needed for command deduplication; it contains command IDs
+  and results, not the device token.
 
 This project does not provide audio downloading, DRM removal, membership
 bypasses, or private chat API automation.

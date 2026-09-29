@@ -140,6 +140,15 @@ docker compose run --rm netease-mcp npm run init:personal -- /data
 docker compose up -d
 ```
 
+### 可选：Windows + MuMu 酷狗设备桥
+
+个人远程服务可以接收 Windows agent 主动发起的 HTTPS 状态上报和命令轮询，
+从而提供 `kugou_status` 与 `kugou_control`。云端不会连接 Windows ADB，
+`127.0.0.1:7555` 也不应暴露到公网。该功能默认关闭，设备 Token 必须从仓库外
+的受限文件读取。部署协议与安全边界见
+[`docs/KUGOU_DEVICE_BRIDGE.md`](docs/KUGOU_DEVICE_BRIDGE.md)，Windows 端说明见
+[`windows-agent/README.md`](windows-agent/README.md)。
+
 ## 远程 HTTP 与手机连接
 
 这一节是旧版秘密 URL 模式。新部署优先采用上面的个人 OAuth 模式。

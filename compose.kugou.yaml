@@ -1,0 +1,11 @@
+services:
+  netease-mcp:
+    environment:
+      KUGOU_BRIDGE_ENABLED: "1"
+      KUGOU_CONTROL_ENABLED: "${KUGOU_CONTROL_ENABLED:-0}"
+      KUGOU_DEVICE_TOKEN_FILE: /run/secrets/kugou-device.secret
+    volumes:
+      - type: bind
+        source: ${KUGOU_DEVICE_TOKEN_FILE_HOST:?set KUGOU_DEVICE_TOKEN_FILE_HOST}
+        target: /run/secrets/kugou-device.secret
+        read_only: true

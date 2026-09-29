@@ -14,6 +14,11 @@ import {
 
 import { PersonalAuthStore, parseMasterKey } from './personal-store.js';
 import { createNeteaseMcpServer } from './mcp-server.js';
+import { KugouBridge } from './kugou-bridge.js';
+import {
+  createKugouAgentApi,
+  readKugouDeviceToken,
+} from './kugou-agent-api.js';
 import { getLyrics, getSongDetails, searchSongs } from './netease.js';
 import {
   addSongsToPlaylist,
@@ -225,7 +230,7 @@ function getClientCredentials(request, form) {
   };
 }
 
-function createOpenApi(origin) {
+function createOpenApi(origin, { kugouEnabled = false } = {}) {
   return {
     openapi: '3.1.0',
     info: {
@@ -348,6 +353,39 @@ function createOpenApi(origin) {
           responses: { 200: { description: 'Updated playlist' } },
         },
       },
+      ...(kugouEnabled
+        ? {
+            '/kugou/status': {
+              get: {
+                operationId: 'getKugouStatus',
+                responses: { 200: { description: 'Latest MuMu Kugou status' } },
+              },
+            },
+            '/kugou/control': {
+              post: {
+                operationId: 'controlKugouPlayback',
+                requestBody: {
+                  required: true,
+                  content: {
+                    'application/json': {
+                      schema: {
+                        type: 'object',
+                        additionalProperties: false,
+                        required: ['action'],
+                        properties: {
+                          action: { enum: ['toggle', 'next', 'previous'] },
+                        },
+                      },
+                    },
+                  },
+                },
+                responses: {
+                  202: { description: 'Command accepted into the short-lived queue' },
+                },
+              },
+            },
+          }
+        : {}),
     },
     components: {
       securitySchemes: {
@@ -389,6 +427,8 @@ function requestIdentity(request) {
 export async function createPersonalNeteaseServer({
   origin,
   store,
+  kugouBridge,
+  kugouAgentApi,
   allowedCorsOrigins = [],
   onError = (error) => console.error(`[netease-personal] ${error.message}`),
 } = {}) {
@@ -439,7 +479,7 @@ export async function createPersonalNeteaseServer({
   };
   const mcpAuthGate = requireBearerAuth({
     verifier,
-    requiredScopes: ['music:read', 'playlist:read', 'playlist:write'],
+    requiredScopes: ['music:read'],
     resourceMetadataUrl: metadataUrl,
   });
   const mcpHandler = createMcpHandler(
@@ -447,6 +487,7 @@ export async function createPersonalNeteaseServer({
       const userId = authInfo?.extra?.userId;
       return createNeteaseMcpServer({
         authInfo,
+        kugouBridge,
         accountContext: userId
           ? {
               getSessionConfiguration: () => store.getNeteaseSessionStatus(userId),
@@ -493,6 +534,28 @@ export async function createPersonalNeteaseServer({
     try {
       const incoming = new URL(request.url ?? '/', originString);
       const pathname = incoming.pathname;
+
+      if (kugouAgentApi && pathname.startsWith('/agent/v1/')) {
+        let body;
+        try {
+          body = ['GET', 'HEAD'].includes(request.method ?? '')
+            ? undefined
+            : await readBody(request, kugouAgentApi.maxBodyBytes);
+        } catch (error) {
+          json(response, error?.statusCode === 413 ? 413 : 400, {
+            error: error?.statusCode === 413 ? 'payload_too_large' : 'invalid_request',
+          });
+          return;
+        }
+        const agentRequest = toWebRequest(
+          request,
+          `${originString}${request.url ?? pathname}`,
+          body,
+        );
+        const agentResponse = await kugouAgentApi.fetch(agentRequest);
+        await writeWebResponse(agentResponse, response);
+        return;
+      }
 
       if (request.method === 'OPTIONS' && pathname.startsWith('/api/')) {
         response.writeHead(204, corsHeaders(request));
@@ -545,7 +608,12 @@ export async function createPersonalNeteaseServer({
       }
 
       if (pathname === '/openapi.json' && request.method === 'GET') {
-        json(response, 200, createOpenApi(originString), { 'access-control-allow-origin': '*' });
+        json(
+          response,
+          200,
+          createOpenApi(originString, { kugouEnabled: Boolean(kugouBridge) }),
+          { 'access-control-allow-origin': '*' },
+        );
         return;
       }
 
@@ -938,13 +1006,35 @@ export async function createPersonalNeteaseServer({
         return;
       }
 
+      if (!kugouBridge && pathname.startsWith('/api/v1/kugou/')) {
+        json(response, 404, { error: 'not_found' });
+        return;
+      }
+
+      if (
+        kugouBridge &&
+        pathname.startsWith('/api/v1/kugou/') &&
+        kugouAgentApi?.matchesAuthorizationHeader(request.headers.authorization)
+      ) {
+        json(response, 401, { error: 'unauthorized' });
+        return;
+      }
+
       if (pathname.startsWith('/api/v1/')) {
         const routeCors = corsHeaders(request);
         const musicMatch = pathname.match(/^\/api\/v1\/lyrics\/(\d{1,20})$/);
         const tracksMatch = pathname.match(/^\/api\/v1\/playlists\/(\d{1,20})\/tracks$/);
         let authInfo;
-        if (pathname === '/api/v1/search' || pathname === '/api/v1/song-details' || musicMatch) {
+        if (
+          pathname === '/api/v1/search' ||
+          pathname === '/api/v1/song-details' ||
+          musicMatch ||
+          (kugouBridge && pathname === '/api/v1/kugou/status')
+        ) {
           authInfo = await requireApiAuth(request, response, ['music:read']);
+          if (!authInfo) return;
+        } else if (kugouBridge && pathname === '/api/v1/kugou/control') {
+          authInfo = await requireApiAuth(request, response, ['player:control']);
           if (!authInfo) return;
         } else if (pathname === '/api/v1/playlists' && request.method === 'GET') {
           authInfo = await requireApiAuth(request, response, ['playlist:read']);
@@ -965,6 +1055,34 @@ export async function createPersonalNeteaseServer({
         }
         if (musicMatch && request.method === 'GET') {
           json(response, 200, await getLyrics(musicMatch[1]), routeCors);
+          return;
+        }
+        if (
+          kugouBridge &&
+          pathname === '/api/v1/kugou/status' &&
+          request.method === 'GET'
+        ) {
+          json(response, 200, kugouBridge.getStatus(), routeCors);
+          return;
+        }
+        if (
+          kugouBridge &&
+          pathname === '/api/v1/kugou/control' &&
+          request.method === 'POST'
+        ) {
+          const body = await readJson(request);
+          if (
+            !body ||
+            typeof body !== 'object' ||
+            Array.isArray(body) ||
+            Object.keys(body).length !== 1 ||
+            !Object.hasOwn(body, 'action')
+          ) {
+            const error = new Error('请求体只能包含 action。');
+            error.statusCode = 400;
+            throw error;
+          }
+          json(response, 202, kugouBridge.enqueueCommand(body.action), routeCors);
           return;
         }
         if (pathname === '/api/v1/playlists' && request.method === 'GET') {
@@ -1064,6 +1182,14 @@ async function writeWebResponse(webResponse, response) {
   Readable.fromWeb(webResponse.body).pipe(response);
 }
 
+function readFeatureFlag(name) {
+  const value = process.env[name] ?? '0';
+  if (!['0', '1'].includes(value)) {
+    throw new Error(`${name} 必须是 0 或 1。`);
+  }
+  return value === '1';
+}
+
 async function main() {
   const origin = process.env.NETEASE_PERSONAL_ORIGIN;
   const storePath = process.env.NETEASE_PERSONAL_STORE_FILE;
@@ -1079,9 +1205,22 @@ async function main() {
     masterKey,
     allowedScopes: PERSONAL_SCOPES,
   });
+  const kugouBridgeEnabled = readFeatureFlag('KUGOU_BRIDGE_ENABLED');
+  const kugouControlEnabled = readFeatureFlag('KUGOU_CONTROL_ENABLED');
+  let kugouBridge;
+  let kugouAgentApi;
+  if (kugouBridgeEnabled) {
+    const deviceToken = await readKugouDeviceToken(
+      process.env.KUGOU_DEVICE_TOKEN_FILE,
+    );
+    kugouBridge = new KugouBridge({ controlEnabled: kugouControlEnabled });
+    kugouAgentApi = createKugouAgentApi({ bridge: kugouBridge, token: deviceToken });
+  }
   const instance = await createPersonalNeteaseServer({
     origin,
     store,
+    kugouBridge,
+    kugouAgentApi,
     allowedCorsOrigins: String(process.env.NETEASE_PERSONAL_CORS_ORIGINS ?? '')
       .split(',')
       .map((value) => value.trim())

@@ -7,11 +7,14 @@ import { join } from 'node:path';
 
 import { PersonalAuthStore, parseMasterKey } from '../src/personal-store.js';
 import { createPersonalNeteaseServer, PERSONAL_SCOPES } from '../src/personal-server.js';
+import { KugouBridge } from '../src/kugou-bridge.js';
+import { createKugouAgentApi } from '../src/kugou-agent-api.js';
 
 const CANONICAL_ORIGIN = 'http://127.0.0.1';
 const RESOURCE = `${CANONICAL_ORIGIN}/mcp`;
+const DEVICE_TOKEN = 'd'.repeat(64);
 
-async function withServer(operation) {
+async function withServer(operation, options = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'netease-personal-server-'));
   const store = new PersonalAuthStore({
     filePath: join(directory, 'auth.json'),
@@ -23,6 +26,7 @@ async function withServer(operation) {
     origin: CANONICAL_ORIGIN,
     store,
     onError: (error) => errors.push(error),
+    ...options,
   });
   await new Promise((resolve) => instance.httpServer.listen(0, '127.0.0.1', resolve));
   const address = instance.httpServer.address();
@@ -76,8 +80,7 @@ test('publishes OAuth discovery and challenges anonymous MCP clients', async () 
     const challenge = unauthorized.headers.get('www-authenticate');
     assert.match(challenge, /oauth-protected-resource\/mcp/);
     assert.match(challenge, /music:read/);
-    assert.match(challenge, /playlist:read/);
-    assert.match(challenge, /playlist:write/);
+    assert.doesNotMatch(challenge, /playlist:read|playlist:write/);
   });
 });
 
@@ -208,4 +211,200 @@ test('completes dynamic registration, PKCE authorization and MCP access', async 
     assert.equal(mcp.result.serverInfo.name, 'netease-music-mcp');
     assert.deepEqual(errors, []);
   });
+});
+
+test('hides every Kugou route and tool when the bridge is not injected', async () => {
+  await withServer(async ({ baseUrl, store }) => {
+    const owner = await store.createOwner('hidden_kugou', 'a sufficiently long password');
+    const token = await store.createPersonalAccessToken(owner.id, {
+      label: 'read only',
+      scopes: ['music:read'],
+      resource: RESOURCE,
+    });
+    const headers = { authorization: `Bearer ${token.token}` };
+
+    assert.equal((await fetch(`${baseUrl}/api/v1/kugou/status`, { headers })).status, 404);
+    assert.equal(
+      (
+        await fetch(`${baseUrl}/agent/v1/status`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        })
+      ).status,
+      404,
+    );
+    const openapi = await (await fetch(`${baseUrl}/openapi.json`)).json();
+    assert.equal(openapi.paths['/kugou/status'], undefined);
+
+    const listed = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        accept: 'application/json, text/event-stream',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    });
+    const payload = await readMcpResponse(listed);
+    assert.equal(payload.result.tools.some((tool) => tool.name.startsWith('kugou_')), false);
+  });
+});
+
+test('integrates the device API, scoped REST routes and scoped MCP tools', async () => {
+  let now = Date.parse('2026-09-27T12:00:00.000Z');
+  let commandCounter = 0;
+  const bridge = new KugouBridge({
+    controlEnabled: true,
+    now: () => now,
+    uuid: () =>
+      `00000000-0000-4000-8000-${String(++commandCounter).padStart(12, '0')}`,
+  });
+  const agentApi = createKugouAgentApi({ bridge, token: DEVICE_TOKEN });
+
+  await withServer(
+    async ({ baseUrl, store, errors }) => {
+      const owner = await store.createOwner('kugou_owner', 'a sufficiently long password');
+      const musicToken = await store.createPersonalAccessToken(owner.id, {
+        label: 'music reader',
+        scopes: ['music:read'],
+        resource: RESOURCE,
+      });
+      const controlToken = await store.createPersonalAccessToken(owner.id, {
+        label: 'player controller',
+        scopes: ['player:control'],
+        resource: RESOURCE,
+      });
+      const fullToken = await store.createPersonalAccessToken(owner.id, {
+        label: 'mcp device controller',
+        scopes: ['music:read', 'player:control'],
+        resource: RESOURCE,
+      });
+
+      const report = {
+        protocol_version: 1,
+        agent_instance_id: '10000000-0000-4000-8000-000000000001',
+        sequence: 1,
+        observed_at: '2026-09-27T12:00:00.000Z',
+        health: 'ok',
+        capabilities: ['status', 'toggle', 'next', 'previous'],
+        player: {
+          package: 'com.kugou.android.lite',
+          playback_state: 'playing',
+          state_code: 3,
+          title: '云端测试歌曲',
+          artist: '测试歌手',
+          album: '测试专辑',
+          position_ms: 5_000,
+        },
+      };
+      const uploaded = await fetch(`${baseUrl}/agent/v1/status`, {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${DEVICE_TOKEN}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(report),
+      });
+      assert.equal(uploaded.status, 200);
+      assert.equal(uploaded.headers.get('access-control-allow-origin'), null);
+
+      const statusResponse = await fetch(`${baseUrl}/api/v1/kugou/status`, {
+        headers: { authorization: `Bearer ${musicToken.token}` },
+      });
+      assert.equal(statusResponse.status, 200);
+      assert.equal((await statusResponse.json()).player.title, '云端测试歌曲');
+
+      const deviceTokenOnUserApi = await fetch(`${baseUrl}/api/v1/kugou/status`, {
+        headers: { authorization: `Bearer ${DEVICE_TOKEN}` },
+      });
+      assert.equal(deviceTokenOnUserApi.status, 401);
+
+      const forbiddenControl = await fetch(`${baseUrl}/api/v1/kugou/control`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${musicToken.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'next' }),
+      });
+      assert.equal(forbiddenControl.status, 403);
+
+      const acceptedControl = await fetch(`${baseUrl}/api/v1/kugou/control`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${controlToken.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'next' }),
+      });
+      assert.equal(acceptedControl.status, 202);
+      assert.equal((await acceptedControl.json()).action, 'next');
+
+      const openapi = await (await fetch(`${baseUrl}/openapi.json`)).json();
+      assert.ok(openapi.paths['/kugou/status']);
+      assert.ok(openapi.paths['/kugou/control']);
+
+      const listResponse = await fetch(`${baseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${fullToken.token}`,
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }),
+      });
+      assert.equal(listResponse.status, 200);
+      const listed = await readMcpResponse(listResponse);
+      assert.ok(listed.result.tools.some((tool) => tool.name === 'kugou_status'));
+      assert.ok(listed.result.tools.some((tool) => tool.name === 'kugou_control'));
+
+      const scopedCall = await fetch(`${baseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${musicToken.token}`,
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 4,
+          method: 'tools/call',
+          params: { name: 'kugou_control', arguments: { action: 'previous' } },
+        }),
+      });
+      assert.equal(scopedCall.status, 200);
+      const denied = await readMcpResponse(scopedCall);
+      assert.equal(denied.result.isError, true);
+      assert.match(denied.result.content[0].text, /player:control/);
+      assert.deepEqual(errors, []);
+      now += 1;
+    },
+    { kugouBridge: bridge, kugouAgentApi: agentApi },
+  );
+});
+
+test('keeps status enabled but rejects command creation when control is disabled', async () => {
+  const bridge = new KugouBridge({ controlEnabled: false });
+  await withServer(
+    async ({ baseUrl, store }) => {
+      const owner = await store.createOwner('status_only', 'a sufficiently long password');
+      const token = await store.createPersonalAccessToken(owner.id, {
+        label: 'status and control scopes',
+        scopes: ['music:read', 'player:control'],
+        resource: RESOURCE,
+      });
+      const response = await fetch(`${baseUrl}/api/v1/kugou/control`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'toggle' }),
+      });
+      assert.equal(response.status, 503);
+      assert.equal((await response.json()).error, '酷狗设备控制当前未启用。');
+    },
+    { kugouBridge: bridge },
+  );
 });

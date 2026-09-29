@@ -48,7 +48,7 @@ async function handle(operation) {
   }
 }
 
-export function createNeteaseMcpServer({ authInfo, accountContext } = {}) {
+export function createNeteaseMcpServer({ authInfo, accountContext, kugouBridge } = {}) {
   const accountOptions = accountContext
     ? {
         sessionProvider: accountContext.loadNeteaseSession,
@@ -172,6 +172,40 @@ export function createNeteaseMcpServer({ authInfo, accountContext } = {}) {
     },
     async () => guarded('music:read', getClientStatus),
   );
+
+  if (kugouBridge) {
+    server.registerTool(
+      'kugou_status',
+      {
+        title: '读取酷狗 MuMu 设备状态',
+        description:
+          '读取 Windows agent 最近上报的酷狗概念版播放状态；离线或过期状态会明确标记，不会直接连接 ADB。',
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      async () => guarded('music:read', () => kugouBridge.getStatus()),
+    );
+
+    server.registerTool(
+      'kugou_control',
+      {
+        title: '控制酷狗 MuMu 播放',
+        description:
+          '向已连接的 Windows agent 排队发送播放/暂停、下一首或上一首命令。设备离线、异常或控制未启用时不会创建命令。',
+        inputSchema: z.object({
+          action: z.enum(['toggle', 'next', 'previous']),
+        }),
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ action }) =>
+        guarded('player:control', () => kugouBridge.enqueueCommand(action)),
+    );
+  }
 
   server.registerTool(
     'netease_search',
