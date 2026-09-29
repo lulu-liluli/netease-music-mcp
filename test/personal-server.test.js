@@ -313,7 +313,12 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
         headers: { authorization: `Bearer ${musicToken.token}` },
       });
       assert.equal(statusResponse.status, 200);
-      assert.equal((await statusResponse.json()).player.title, '云端测试歌曲');
+      const activeStatus = await statusResponse.json();
+      assert.equal(activeStatus.device_id, 'pc-mumu');
+      assert.equal(activeStatus.device_name, 'Lucy-PC-MuMu');
+      assert.equal(activeStatus.device_type, 'windows_mumu');
+      assert.equal(activeStatus.active, true);
+      assert.equal(activeStatus.player.title, '云端测试歌曲');
 
       const deviceTokenOnUserApi = await fetch(`${baseUrl}/api/v1/kugou/status`, {
         headers: { authorization: `Bearer ${DEVICE_TOKEN}` },
@@ -339,7 +344,9 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
         body: JSON.stringify({ action: 'next' }),
       });
       assert.equal(acceptedControl.status, 202);
-      assert.equal((await acceptedControl.json()).action, 'next');
+      const acceptedControlBody = await acceptedControl.json();
+      assert.equal(acceptedControlBody.device_id, 'pc-mumu');
+      assert.equal(acceptedControlBody.action, 'next');
 
       const openapi = await (await fetch(`${baseUrl}/openapi.json`)).json();
       assert.ok(openapi.paths['/kugou/status']);
@@ -397,10 +404,10 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       assert.equal(mcpStatusResponse.status, 200);
       const mcpStatus = await readMcpResponse(mcpStatusResponse);
       assert.equal(mcpStatus.result.isError, undefined);
-      assert.equal(
-        JSON.parse(mcpStatus.result.content[0].text).player.title,
-        '云端测试歌曲',
-      );
+      const mcpDeviceStatus = JSON.parse(mcpStatus.result.content[0].text);
+      assert.equal(mcpDeviceStatus.device_id, 'pc-mumu');
+      assert.equal(mcpDeviceStatus.active, true);
+      assert.equal(mcpDeviceStatus.player.title, '云端测试歌曲');
 
       const scopedCall = await fetch(`${baseUrl}/mcp`, {
         method: 'POST',
@@ -452,7 +459,9 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       assert.equal(authorizedCall.status, 200);
       const accepted = await readMcpResponse(authorizedCall);
       assert.equal(accepted.result.isError, undefined);
-      assert.equal(JSON.parse(accepted.result.content[0].text).action, 'previous');
+      const acceptedMcpCommand = JSON.parse(accepted.result.content[0].text);
+      assert.equal(acceptedMcpCommand.device_id, 'pc-mumu');
+      assert.equal(acceptedMcpCommand.action, 'previous');
       assert.equal(commandCounter, 2);
       assert.deepEqual(errors, []);
       now += 1;

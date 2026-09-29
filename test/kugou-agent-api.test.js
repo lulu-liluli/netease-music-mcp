@@ -11,7 +11,21 @@ import {
 } from '../src/kugou-agent-api.js';
 
 const TOKEN = 'a'.repeat(64);
+const PHONE_TOKEN = 'b'.repeat(64);
 const COMMAND_ID = '00000000-0000-4000-8000-000000000001';
+const PHONE_COMMAND_ID = '00000000-0000-4000-8000-000000000002';
+const DEVICES = [
+  {
+    deviceId: 'pc-mumu',
+    deviceName: 'Lucy-PC-MuMu',
+    deviceType: 'windows_mumu',
+  },
+  {
+    deviceId: 'phone',
+    deviceName: 'Lucy-Phone',
+    deviceType: 'android',
+  },
+];
 
 function validStatus(overrides = {}) {
   return {
@@ -49,6 +63,25 @@ function setup({ controlEnabled = true, maxBodyBytes } = {}) {
     onError: (error) => errors.push(error),
   });
   return { bridge, api, errors, advance: (value) => (now += value) };
+}
+
+function setupMultiple() {
+  let idIndex = 0;
+  const commandIds = [COMMAND_ID, PHONE_COMMAND_ID];
+  const bridge = new KugouBridge({
+    controlEnabled: true,
+    devices: DEVICES,
+    now: () => Date.parse('2026-09-27T12:00:00.000Z'),
+    uuid: () => commandIds[idIndex++],
+  });
+  const api = createKugouAgentApi({
+    bridge,
+    devices: [
+      { ...DEVICES[0], token: TOKEN },
+      { ...DEVICES[1], token: PHONE_TOKEN },
+    ],
+  });
+  return { bridge, api };
 }
 
 function request(path, {
@@ -98,6 +131,39 @@ test('enforces the 43-character minimum when constructing the agent API', () => 
   );
 });
 
+test('maps the legacy single token to the pc-mumu identity', () => {
+  const { api } = setup();
+  assert.deepEqual(api.authenticateAuthorizationHeader(`Bearer ${TOKEN}`), {
+    deviceId: 'pc-mumu',
+    deviceName: 'Lucy-PC-MuMu',
+    deviceType: 'windows_mumu',
+  });
+});
+
+test('rejects duplicate device IDs and duplicate tokens', () => {
+  const bridge = new KugouBridge({ devices: DEVICES });
+  assert.throws(
+    () => createKugouAgentApi({
+      bridge,
+      devices: [
+        { ...DEVICES[0], token: TOKEN },
+        { ...DEVICES[0], token: PHONE_TOKEN },
+      ],
+    }),
+    /ID 重复/,
+  );
+  assert.throws(
+    () => createKugouAgentApi({
+      bridge,
+      devices: [
+        { ...DEVICES[0], token: TOKEN },
+        { ...DEVICES[1], token: TOKEN },
+      ],
+    }),
+    /Token 重复/,
+  );
+});
+
 test('requires the independent bearer token without enabling CORS', async () => {
   const { api } = setup();
   for (const token of [null, 'wrong-token-value-that-is-long-enough']) {
@@ -133,6 +199,76 @@ test('accepts strict status payloads and rejects unknown or sensitive fields', a
   assert.equal((await rejected.json()).error, 'invalid_request');
 });
 
+test('isolates status, claim and ACK by the token-bound device identity', async () => {
+  const { api, bridge } = setupMultiple();
+  assert.deepEqual(api.authenticateAuthorizationHeader(`Bearer ${PHONE_TOKEN}`), {
+    deviceId: 'phone',
+    deviceName: 'Lucy-Phone',
+    deviceType: 'android',
+  });
+
+  const pcStatus = await api.fetch(
+    request('/agent/v1/status', {
+      method: 'PUT',
+      token: TOKEN,
+      body: validStatus({
+        player: { ...validStatus().player, title: 'PC song' },
+      }),
+    }),
+  );
+  const phoneStatus = await api.fetch(
+    request('/agent/v1/status', {
+      method: 'PUT',
+      token: PHONE_TOKEN,
+      body: validStatus({
+        player: { ...validStatus().player, title: 'Phone song' },
+      }),
+    }),
+  );
+  assert.equal(pcStatus.status, 200);
+  assert.equal(phoneStatus.status, 200);
+  assert.equal(bridge.getStatus('pc-mumu').player.title, 'PC song');
+  assert.equal(bridge.getStatus('phone').player.title, 'Phone song');
+
+  const pcCommand = bridge.enqueueCommand('next', 'pc-mumu');
+  const phoneCommand = bridge.enqueueCommand('previous', 'phone');
+  const claimedByPc = await api.fetch(
+    request('/agent/v1/commands/claim', {
+      token: TOKEN,
+      body: { protocol_version: 1 },
+    }),
+  );
+  const claimedByPhone = await api.fetch(
+    request('/agent/v1/commands/claim', {
+      token: PHONE_TOKEN,
+      body: { protocol_version: 1 },
+    }),
+  );
+  assert.equal((await claimedByPc.json()).command.id, pcCommand.id);
+  assert.equal((await claimedByPhone.json()).command.id, phoneCommand.id);
+
+  const ackBody = {
+    protocol_version: 1,
+    result: 'succeeded',
+    completed_at: '2026-09-27T12:00:02.000Z',
+  };
+  const crossDeviceAck = await api.fetch(
+    request(`/agent/v1/commands/${pcCommand.id}/ack`, {
+      token: PHONE_TOKEN,
+      body: ackBody,
+    }),
+  );
+  assert.equal(crossDeviceAck.status, 404);
+  assert.equal((await crossDeviceAck.json()).error, 'command_not_found');
+  assert.equal(
+    (await api.fetch(request(`/agent/v1/commands/${pcCommand.id}/ack`, {
+      token: TOKEN,
+      body: ackBody,
+    }))).status,
+    200,
+  );
+});
+
 test('limits request bodies before parsing JSON', async () => {
   const { api } = setup({ maxBodyBytes: 32 });
   const response = await api.fetch(
@@ -150,7 +286,7 @@ test('limits request bodies before parsing JSON', async () => {
 
 test('claims commands and makes repeated ACKs idempotent', async () => {
   const { api, bridge } = setup();
-  bridge.recordStatus(validStatus());
+  bridge.recordStatus('pc-mumu', validStatus());
   bridge.enqueueCommand('next');
 
   const claimed = await api.fetch(
@@ -188,9 +324,9 @@ test('claims commands and makes repeated ACKs idempotent', async () => {
 
 test('accepts only bounded failure codes in failed ACKs', async () => {
   const { api, bridge } = setup();
-  bridge.recordStatus(validStatus());
+  bridge.recordStatus('pc-mumu', validStatus());
   bridge.enqueueCommand('toggle');
-  bridge.claimCommand();
+  bridge.claimCommand('pc-mumu');
 
   const missingError = await api.fetch(
     request(`/agent/v1/commands/${COMMAND_ID}/ack`, {

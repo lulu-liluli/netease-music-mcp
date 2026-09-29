@@ -215,9 +215,9 @@ export function createNeteaseMcpServer({
     server.registerTool(
       'kugou_status',
       {
-        title: '读取酷狗 MuMu 设备状态',
+        title: '读取当前活动酷狗设备状态',
         description:
-          '读取 Windows agent 最近上报的酷狗概念版播放状态；离线或过期状态会明确标记，不会直接连接 ADB。',
+          '读取当前活动酷狗设备最近上报的播放状态；离线或过期状态会明确标记。',
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true, openWorldHint: false },
         _meta: {
@@ -230,9 +230,9 @@ export function createNeteaseMcpServer({
     server.registerTool(
       'kugou_control',
       {
-        title: '控制酷狗 MuMu 播放',
+        title: '控制当前活动酷狗设备播放',
         description:
-          '向已连接的 Windows agent 排队发送播放/暂停、下一首或上一首命令。设备离线、异常或控制未启用时不会创建命令。',
+          '向当前活动酷狗设备排队发送播放/暂停、下一首或上一首命令。设备离线、异常或控制未启用时不会创建命令。',
         inputSchema: z.object({
           action: z.enum(['toggle', 'next', 'previous']),
         }),

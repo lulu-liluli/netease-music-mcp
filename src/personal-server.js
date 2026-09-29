@@ -437,7 +437,7 @@ function createOpenApi(origin, { kugouEnabled = false } = {}) {
             '/kugou/status': {
               get: {
                 operationId: 'getKugouStatus',
-                responses: { 200: { description: 'Latest MuMu Kugou status' } },
+                responses: { 200: { description: 'Latest active Kugou device status' } },
               },
             },
             '/kugou/control': {
@@ -1296,7 +1296,13 @@ async function main() {
     const deviceToken = await readKugouDeviceToken(
       process.env.KUGOU_DEVICE_TOKEN_FILE,
     );
-    kugouBridge = new KugouBridge({ controlEnabled: kugouControlEnabled });
+    const activeDeviceId = String(
+      process.env.KUGOU_ACTIVE_DEVICE_ID ?? 'pc-mumu',
+    ).trim();
+    kugouBridge = new KugouBridge({
+      controlEnabled: kugouControlEnabled,
+      activeDeviceId,
+    });
     kugouAgentApi = createKugouAgentApi({ bridge: kugouBridge, token: deviceToken });
   }
   const instance = await createPersonalNeteaseServer({

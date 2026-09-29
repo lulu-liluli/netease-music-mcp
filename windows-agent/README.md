@@ -45,6 +45,7 @@ The server-side feature flags default to disabled:
 ```dotenv
 KUGOU_BRIDGE_ENABLED=1
 KUGOU_CONTROL_ENABLED=0
+KUGOU_ACTIVE_DEVICE_ID=pc-mumu
 KUGOU_DEVICE_TOKEN_FILE=/permission-restricted/path/kugou-device.secret
 ```
 

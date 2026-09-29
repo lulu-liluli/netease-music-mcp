@@ -1,8 +1,10 @@
 # Kugou Windows device bridge
 
-This optional bridge connects the personal remote MCP service to one Windows
-MuMu instance running Kugou Concept Edition. It is a single-device,
-single-process, in-memory first version.
+This optional bridge connects the personal remote MCP service to a Windows
+MuMu instance running Kugou Concept Edition. The server keeps status, agent
+instance lifecycle and commands in per-device in-memory state. The current
+deployment configuration remains backward compatible and registers only one
+device: `pc-mumu` (`Lucy-PC-MuMu`, type `windows_mumu`).
 
 ## Trust boundaries
 
@@ -35,6 +37,7 @@ The host configuration contains only non-secret values:
 
 ```dotenv
 KUGOU_CONTROL_ENABLED=0
+KUGOU_ACTIVE_DEVICE_ID=pc-mumu
 KUGOU_DEVICE_TOKEN_FILE_HOST=/opt/music-bridge/secrets/kugou-device.secret
 ```
 
@@ -47,6 +50,10 @@ enters Compose environment variables or command-line arguments.
 The first deployment must keep `KUGOU_CONTROL_ENABLED=0`. Verify authenticated
 status reporting, online/offline transitions and `kugou_status` before enabling
 control and recreating the container.
+
+When only the legacy `KUGOU_DEVICE_TOKEN_FILE` configuration is present, the
+server binds that token to `pc-mumu` and uses it as the active device. No
+second device credential is configured by this deployment overlay.
 
 This overlay is only for the Ubuntu cloud server. Do not use it to run or
 configure the Windows agent; the agent follows `windows-agent/README.md` and
@@ -140,5 +147,5 @@ reported, or while control is disabled.
   queue.
 - An ACK confirms that the local ADB operation completed, not that the Kugou UI
   necessarily changed as expected.
-- The Windows agent is the only supported companion in this version. There is
-  no Android phone companion.
+- The Windows agent is the only configured and supported companion in this
+  deployment version. There is no Android phone companion or phone credential.

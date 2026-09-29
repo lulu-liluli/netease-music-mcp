@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 
 import {
   KUGOU_ACK_RESULTS,
+  LEGACY_KUGOU_DEVICE,
   KugouBridgeError,
 } from './kugou-bridge.js';
 
@@ -276,6 +277,43 @@ function digest(value) {
   return createHash('sha256').update(value).digest();
 }
 
+function buildDeviceCredentials(bridge, token, devices) {
+  let configuredDevices = devices;
+  if (configuredDevices === undefined) {
+    if (!TOKEN_PATTERN.test(token ?? '')) {
+      throw new Error('缺少有效的酷狗设备 Token。');
+    }
+    configuredDevices = [{ ...LEGACY_KUGOU_DEVICE, token }];
+  } else if (token !== undefined) {
+    throw new Error('不能同时配置单设备 Token 和多设备凭据。');
+  }
+  if (!Array.isArray(configuredDevices) || configuredDevices.length < 1) {
+    throw new Error('至少需要配置一个酷狗设备凭据。');
+  }
+
+  const deviceIds = new Set();
+  const tokens = new Set();
+  return configuredDevices.map((device) => {
+    const identity = bridge.getDeviceIdentity(device?.deviceId);
+    if (
+      identity.deviceName !== device.deviceName ||
+      identity.deviceType !== device.deviceType ||
+      !TOKEN_PATTERN.test(device.token ?? '')
+    ) {
+      throw new Error('酷狗设备凭据无效。');
+    }
+    if (deviceIds.has(identity.deviceId)) {
+      throw new Error(`酷狗设备凭据 ID 重复：${identity.deviceId}`);
+    }
+    if (tokens.has(device.token)) {
+      throw new Error('酷狗设备 Token 重复。');
+    }
+    deviceIds.add(identity.deviceId);
+    tokens.add(device.token);
+    return { identity, tokenDigest: digest(device.token) };
+  });
+}
+
 export async function readKugouDeviceToken(filePath) {
   if (!filePath) throw new Error('必须配置 KUGOU_DEVICE_TOKEN_FILE。');
   let token;
@@ -293,21 +331,35 @@ export async function readKugouDeviceToken(filePath) {
 export function createKugouAgentApi({
   bridge,
   token,
+  devices,
   maxBodyBytes = KUGOU_AGENT_MAX_BODY_BYTES,
   onError = () => console.error('[kugou-agent-api] internal request error'),
 } = {}) {
   if (!bridge) throw new Error('缺少 KugouBridge。');
-  if (!TOKEN_PATTERN.test(token ?? '')) throw new Error('缺少有效的酷狗设备 Token。');
-  const expectedDigest = digest(token);
+  const credentials = buildDeviceCredentials(bridge, token, devices);
 
-  function matchesAuthorizationHeader(value) {
+  function authenticateAuthorizationHeader(value) {
     const match = String(value ?? '').match(/^Bearer (.+)$/);
     const supplied = match && TOKEN_PATTERN.test(match[1]) ? match[1] : '';
-    return timingSafeEqual(expectedDigest, digest(supplied));
+    const suppliedDigest = digest(supplied);
+    let identity = null;
+    for (const credential of credentials) {
+      if (timingSafeEqual(credential.tokenDigest, suppliedDigest)) {
+        identity = credential.identity;
+      }
+    }
+    return identity ? { ...identity } : null;
+  }
+
+  function matchesAuthorizationHeader(value) {
+    return Boolean(authenticateAuthorizationHeader(value));
   }
 
   async function fetch(request) {
-    if (!matchesAuthorizationHeader(request.headers.get('authorization'))) {
+    const identity = authenticateAuthorizationHeader(
+      request.headers.get('authorization'),
+    );
+    if (!identity) {
       return jsonResponse(
         401,
         { error: 'unauthorized' },
@@ -322,7 +374,7 @@ export function createKugouAgentApi({
           return emptyResponse(405, { allow: 'PUT' });
         }
         const report = validateStatus(await readJson(request, maxBodyBytes));
-        const result = bridge.recordStatus(report);
+        const result = bridge.recordStatus(identity.deviceId, report);
         return jsonResponse(200, {
           ok: true,
           accepted: result.accepted,
@@ -337,7 +389,7 @@ export function createKugouAgentApi({
           return emptyResponse(405, { allow: 'POST' });
         }
         validateClaim(await readJson(request, maxBodyBytes, { allowEmpty: true }));
-        const command = bridge.claimCommand();
+        const command = bridge.claimCommand(identity.deviceId);
         return command
           ? jsonResponse(200, { command })
           : emptyResponse(204);
@@ -355,6 +407,7 @@ export function createKugouAgentApi({
         }
         const acknowledgement = validateAck(await readJson(request, maxBodyBytes));
         const command = bridge.acknowledgeCommand(
+          identity.deviceId,
           ackMatch[1],
           acknowledgement.result,
         );
@@ -374,5 +427,10 @@ export function createKugouAgentApi({
     }
   }
 
-  return { fetch, matchesAuthorizationHeader, maxBodyBytes };
+  return {
+    fetch,
+    authenticateAuthorizationHeader,
+    matchesAuthorizationHeader,
+    maxBodyBytes,
+  };
 }
