@@ -1,4 +1,9 @@
-import { McpServer } from '@modelcontextprotocol/server';
+import {
+  bearerAuthChallengeResponse,
+  McpServer,
+  OAuthError,
+  OAuthErrorCode,
+} from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 
 import {
@@ -40,6 +45,35 @@ function failure(error) {
   };
 }
 
+function oauthSecuritySchemes(scopes) {
+  return [{ type: 'oauth2', scopes }];
+}
+
+function insufficientScopeFailure(scope, resourceMetadataUrl) {
+  const requiredScopes = [...new Set(['music:read', scope])];
+  const response = bearerAuthChallengeResponse(
+    new OAuthError(
+      OAuthErrorCode.InsufficientScope,
+      `Required scope missing: ${scope}`,
+    ),
+    { requiredScopes, resourceMetadataUrl },
+  );
+  const challenge = response.headers.get('www-authenticate');
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `当前 Token 缺少 ${scope} 权限。`,
+      },
+    ],
+    isError: true,
+    _meta: {
+      'mcp/www_authenticate': [challenge],
+    },
+  };
+}
+
 async function handle(operation) {
   try {
     return success(await operation());
@@ -48,20 +82,24 @@ async function handle(operation) {
   }
 }
 
-export function createNeteaseMcpServer({ authInfo, accountContext, kugouBridge } = {}) {
+export function createNeteaseMcpServer({
+  authInfo,
+  accountContext,
+  kugouBridge,
+  resourceMetadataUrl,
+} = {}) {
   const accountOptions = accountContext
     ? {
         sessionProvider: accountContext.loadNeteaseSession,
         sessionConfigurationProvider: accountContext.getSessionConfiguration,
       }
     : {};
-  const guarded = (scope, operation) =>
-    handle(async () => {
-      if (authInfo && !authInfo.scopes.includes(scope)) {
-        throw new Error(`当前 Token 缺少 ${scope} 权限。`);
-      }
-      return operation();
-    });
+  const guarded = (scope, operation) => {
+    if (authInfo && !authInfo.scopes.includes(scope)) {
+      return insufficientScopeFailure(scope, resourceMetadataUrl);
+    }
+    return handle(operation);
+  };
   const server = new McpServer(
     {
       name: 'netease-music-mcp',
@@ -182,6 +220,9 @@ export function createNeteaseMcpServer({ authInfo, accountContext, kugouBridge }
           '读取 Windows agent 最近上报的酷狗概念版播放状态；离线或过期状态会明确标记，不会直接连接 ADB。',
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true, openWorldHint: false },
+        _meta: {
+          securitySchemes: oauthSecuritySchemes(['music:read']),
+        },
       },
       async () => guarded('music:read', () => kugouBridge.getStatus()),
     );
@@ -200,6 +241,12 @@ export function createNeteaseMcpServer({ authInfo, accountContext, kugouBridge }
           destructiveHint: false,
           idempotentHint: false,
           openWorldHint: false,
+        },
+        _meta: {
+          securitySchemes: oauthSecuritySchemes([
+            'music:read',
+            'player:control',
+          ]),
         },
       },
       async ({ action }) =>

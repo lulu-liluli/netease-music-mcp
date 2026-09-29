@@ -356,10 +356,20 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       });
       assert.equal(listResponse.status, 200);
       const listed = await readMcpResponse(listResponse);
-      assert.ok(listed.result.tools.some((tool) => tool.name === 'kugou_status'));
-      assert.ok(listed.result.tools.some((tool) => tool.name === 'kugou_control'));
+      const kugouStatusTool = listed.result.tools.find(
+        (tool) => tool.name === 'kugou_status',
+      );
+      const kugouControlTool = listed.result.tools.find(
+        (tool) => tool.name === 'kugou_control',
+      );
+      assert.deepEqual(kugouStatusTool?._meta?.securitySchemes, [
+        { type: 'oauth2', scopes: ['music:read'] },
+      ]);
+      assert.deepEqual(kugouControlTool?._meta?.securitySchemes, [
+        { type: 'oauth2', scopes: ['music:read', 'player:control'] },
+      ]);
 
-      const scopedCall = await fetch(`${baseUrl}/mcp`, {
+      const mcpStatusResponse = await fetch(`${baseUrl}/mcp`, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${musicToken.token}`,
@@ -370,6 +380,28 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
           jsonrpc: '2.0',
           id: 4,
           method: 'tools/call',
+          params: { name: 'kugou_status', arguments: {} },
+        }),
+      });
+      assert.equal(mcpStatusResponse.status, 200);
+      const mcpStatus = await readMcpResponse(mcpStatusResponse);
+      assert.equal(mcpStatus.result.isError, undefined);
+      assert.equal(
+        JSON.parse(mcpStatus.result.content[0].text).player.title,
+        '云端测试歌曲',
+      );
+
+      const scopedCall = await fetch(`${baseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${musicToken.token}`,
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 5,
+          method: 'tools/call',
           params: { name: 'kugou_control', arguments: { action: 'previous' } },
         }),
       });
@@ -377,6 +409,40 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       const denied = await readMcpResponse(scopedCall);
       assert.equal(denied.result.isError, true);
       assert.match(denied.result.content[0].text, /player:control/);
+      const challenges = denied.result._meta?.['mcp/www_authenticate'];
+      assert.equal(challenges?.length, 1);
+      const challenge = challenges[0];
+      assert.match(challenge, /^Bearer /);
+      assert.match(challenge, /error="insufficient_scope"/);
+      assert.match(challenge, /error_description="Required scope missing: player:control"/);
+      assert.match(challenge, /scope="music:read player:control"/);
+      assert.match(
+        challenge,
+        /resource_metadata="http:\/\/127\.0\.0\.1\/\.well-known\/oauth-protected-resource\/mcp"/,
+      );
+      const errorDescription = challenge.match(/error_description="([^"]+)"/)?.[1];
+      assert.match(errorDescription, /^[\x20-\x7e]+$/);
+      assert.equal(commandCounter, 1);
+
+      const authorizedCall = await fetch(`${baseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${fullToken.token}`,
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 6,
+          method: 'tools/call',
+          params: { name: 'kugou_control', arguments: { action: 'previous' } },
+        }),
+      });
+      assert.equal(authorizedCall.status, 200);
+      const accepted = await readMcpResponse(authorizedCall);
+      assert.equal(accepted.result.isError, undefined);
+      assert.equal(JSON.parse(accepted.result.content[0].text).action, 'previous');
+      assert.equal(commandCounter, 2);
       assert.deepEqual(errors, []);
       now += 1;
     },

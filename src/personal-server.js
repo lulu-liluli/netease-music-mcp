@@ -488,6 +488,7 @@ export async function createPersonalNeteaseServer({
       return createNeteaseMcpServer({
         authInfo,
         kugouBridge,
+        resourceMetadataUrl: metadataUrl,
         accountContext: userId
           ? {
               getSessionConfiguration: () => store.getNeteaseSessionStatus(userId),
