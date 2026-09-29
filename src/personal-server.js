@@ -164,6 +164,85 @@ async function readBody(request, limit = MAX_BODY_BYTES) {
   return Buffer.concat(chunks);
 }
 
+const KUGOU_SECURITY_SCHEME_TOOLS = new Set(['kugou_status', 'kugou_control']);
+
+function isSingleToolsListRequest(body) {
+  if (!body) return false;
+  try {
+    const message = JSON.parse(body.toString('utf8'));
+    return (
+      message !== null &&
+      typeof message === 'object' &&
+      !Array.isArray(message) &&
+      message.jsonrpc === '2.0' &&
+      message.method === 'tools/list'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function addKugouRootSecuritySchemes(message) {
+  if (!Array.isArray(message?.result?.tools)) return message;
+  return {
+    ...message,
+    result: {
+      ...message.result,
+      tools: message.result.tools.map((tool) => {
+        if (
+          !KUGOU_SECURITY_SCHEME_TOOLS.has(tool?.name) ||
+          Object.hasOwn(tool, 'securitySchemes') ||
+          !Array.isArray(tool?._meta?.securitySchemes)
+        ) {
+          return tool;
+        }
+        return {
+          ...tool,
+          securitySchemes: structuredClone(tool._meta.securitySchemes),
+        };
+      }),
+    },
+  };
+}
+
+async function adaptToolsListResponse(webResponse) {
+  const contentType = (webResponse.headers.get('content-type') ?? '').toLowerCase();
+  const isJson = contentType.includes('application/json');
+  const isEventStream = contentType.includes('text/event-stream');
+  if (!isJson && !isEventStream) return webResponse;
+
+  const originalBody = await webResponse.text();
+  let adaptedBody = originalBody;
+  try {
+    if (isJson) {
+      adaptedBody = JSON.stringify(addKugouRootSecuritySchemes(JSON.parse(originalBody)));
+    } else {
+      let parseFailed = false;
+      adaptedBody = originalBody.replace(/^data:(.*)$/gm, (line, data) => {
+        const payload = data.trim();
+        if (!payload || payload === '[DONE]') return line;
+        try {
+          return `data: ${JSON.stringify(addKugouRootSecuritySchemes(JSON.parse(payload)))}`;
+        } catch {
+          parseFailed = true;
+          return line;
+        }
+      });
+      if (parseFailed) adaptedBody = originalBody;
+    }
+  } catch {
+    adaptedBody = originalBody;
+  }
+
+  const headers = new Headers(webResponse.headers);
+  headers.delete('content-length');
+  return new Response(adaptedBody, {
+    status: webResponse.status,
+    statusText: webResponse.statusText,
+    headers,
+  });
+}
+
 async function readForm(request) {
   const contentType = String(request.headers['content-type'] ?? '').split(';')[0];
   if (contentType !== 'application/x-www-form-urlencoded') {
@@ -1003,7 +1082,10 @@ export async function createPersonalNeteaseServer({
           return;
         }
         const mcpResponse = await mcpHandler.fetch(mcpRequest, { authInfo });
-        await writeWebResponse(mcpResponse, response);
+        const finalResponse = isSingleToolsListRequest(body)
+          ? await adaptToolsListResponse(mcpResponse)
+          : mcpResponse;
+        await writeWebResponse(finalResponse, response);
         return;
       }
 

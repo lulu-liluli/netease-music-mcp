@@ -362,12 +362,23 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       const kugouControlTool = listed.result.tools.find(
         (tool) => tool.name === 'kugou_control',
       );
+      const neteaseSearchTool = listed.result.tools.find(
+        (tool) => tool.name === 'netease_search',
+      );
+      assert.deepEqual(kugouStatusTool?.securitySchemes, [
+        { type: 'oauth2', scopes: ['music:read'] },
+      ]);
       assert.deepEqual(kugouStatusTool?._meta?.securitySchemes, [
         { type: 'oauth2', scopes: ['music:read'] },
+      ]);
+      assert.deepEqual(kugouControlTool?.securitySchemes, [
+        { type: 'oauth2', scopes: ['music:read', 'player:control'] },
       ]);
       assert.deepEqual(kugouControlTool?._meta?.securitySchemes, [
         { type: 'oauth2', scopes: ['music:read', 'player:control'] },
       ]);
+      assert.ok(neteaseSearchTool);
+      assert.equal(Object.hasOwn(neteaseSearchTool, 'securitySchemes'), false);
 
       const mcpStatusResponse = await fetch(`${baseUrl}/mcp`, {
         method: 'POST',
