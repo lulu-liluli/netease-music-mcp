@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +12,8 @@ import { createKugouAgentApi } from '../src/kugou-agent-api.js';
 
 const CANONICAL_ORIGIN = 'http://127.0.0.1';
 const RESOURCE = `${CANONICAL_ORIGIN}/mcp`;
-const DEVICE_TOKEN = 'd'.repeat(64);
+const DEVICE_TOKEN = randomBytes(32).toString('hex');
+const PHONE_DEVICE_TOKEN = randomBytes(32).toString('hex');
 
 async function withServer(operation, options = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'netease-personal-server-'));
@@ -256,11 +257,40 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
   let commandCounter = 0;
   const bridge = new KugouBridge({
     controlEnabled: true,
+    devices: [
+      {
+        deviceId: 'pc-mumu',
+        deviceName: 'Lucy-PC-MuMu',
+        deviceType: 'windows_mumu',
+      },
+      {
+        deviceId: 'phone',
+        deviceName: 'Lucy-Phone',
+        deviceType: 'android',
+      },
+    ],
+    activeDeviceId: 'pc-mumu',
     now: () => now,
     uuid: () =>
       `00000000-0000-4000-8000-${String(++commandCounter).padStart(12, '0')}`,
   });
-  const agentApi = createKugouAgentApi({ bridge, token: DEVICE_TOKEN });
+  const agentApi = createKugouAgentApi({
+    bridge,
+    devices: [
+      {
+        deviceId: 'pc-mumu',
+        deviceName: 'Lucy-PC-MuMu',
+        deviceType: 'windows_mumu',
+        token: DEVICE_TOKEN,
+      },
+      {
+        deviceId: 'phone',
+        deviceName: 'Lucy-Phone',
+        deviceType: 'android',
+        token: PHONE_DEVICE_TOKEN,
+      },
+    ],
+  });
 
   await withServer(
     async ({ baseUrl, store, errors }) => {
@@ -319,6 +349,8 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       assert.equal(activeStatus.device_type, 'windows_mumu');
       assert.equal(activeStatus.active, true);
       assert.equal(activeStatus.player.title, '云端测试歌曲');
+      assert.equal(bridge.getStatus('phone').online, false);
+      assert.equal(bridge.getStatus('phone').reason, 'never_seen');
 
       const deviceTokenOnUserApi = await fetch(`${baseUrl}/api/v1/kugou/status`, {
         headers: { authorization: `Bearer ${DEVICE_TOKEN}` },
@@ -347,6 +379,7 @@ test('integrates the device API, scoped REST routes and scoped MCP tools', async
       const acceptedControlBody = await acceptedControl.json();
       assert.equal(acceptedControlBody.device_id, 'pc-mumu');
       assert.equal(acceptedControlBody.action, 'next');
+      assert.equal(bridge.claimCommand('phone'), null);
 
       const openapi = await (await fetch(`${baseUrl}/openapi.json`)).json();
       assert.ok(openapi.paths['/kugou/status']);

@@ -17,7 +17,7 @@ import { createNeteaseMcpServer } from './mcp-server.js';
 import { KugouBridge } from './kugou-bridge.js';
 import {
   createKugouAgentApi,
-  readKugouDeviceToken,
+  loadKugouDeviceRegistration,
 } from './kugou-agent-api.js';
 import { getLyrics, getSongDetails, searchSongs } from './netease.js';
 import {
@@ -1293,17 +1293,26 @@ async function main() {
   let kugouBridge;
   let kugouAgentApi;
   if (kugouBridgeEnabled) {
-    const deviceToken = await readKugouDeviceToken(
-      process.env.KUGOU_DEVICE_TOKEN_FILE,
-    );
+    const registration = await loadKugouDeviceRegistration({
+      devicesConfigFile: process.env.KUGOU_DEVICES_CONFIG_FILE,
+      deviceTokenFile: process.env.KUGOU_DEVICE_TOKEN_FILE,
+    });
     const activeDeviceId = String(
       process.env.KUGOU_ACTIVE_DEVICE_ID ?? 'pc-mumu',
     ).trim();
     kugouBridge = new KugouBridge({
       controlEnabled: kugouControlEnabled,
       activeDeviceId,
+      ...(registration.mode === 'multi'
+        ? { devices: registration.bridgeDevices }
+        : {}),
     });
-    kugouAgentApi = createKugouAgentApi({ bridge: kugouBridge, token: deviceToken });
+    kugouAgentApi = createKugouAgentApi({
+      bridge: kugouBridge,
+      ...(registration.mode === 'multi'
+        ? { devices: registration.agentDevices }
+        : { token: registration.token }),
+    });
   }
   const instance = await createPersonalNeteaseServer({
     origin,

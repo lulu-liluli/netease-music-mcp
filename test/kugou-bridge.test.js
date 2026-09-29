@@ -212,6 +212,26 @@ test('routes default status and control only to the active device without fallba
   assert.equal(bridge.claimCommand('phone').id, command.id);
 });
 
+test('keeps an online active PC controllable while a registered phone is never seen', () => {
+  const { bridge } = setup({ devices: DEVICES, activeDeviceId: 'pc-mumu' });
+  bridge.recordStatus('pc-mumu', status());
+
+  assert.equal(bridge.getStatus().device_id, 'pc-mumu');
+  assert.equal(bridge.getStatus().online, true);
+  assert.equal(bridge.getStatus('phone').reason, 'never_seen');
+  const command = bridge.enqueueCommand('next');
+  assert.equal(command.device_id, 'pc-mumu');
+  assert.equal(bridge.claimCommand('phone'), null);
+  assert.equal(bridge.claimCommand('pc-mumu').id, command.id);
+});
+
+test('rejects an active device that is not registered', () => {
+  assert.throws(
+    () => setup({ devices: DEVICES, activeDeviceId: 'missing-device' }),
+    /活动酷狗设备不存在/,
+  );
+});
+
 test('enqueues UUID commands in FIFO order and reclaims the same command until ACK', () => {
   const { bridge } = setup();
   bridge.recordStatus('pc-mumu', status());

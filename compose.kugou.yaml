@@ -4,9 +4,20 @@ services:
       KUGOU_BRIDGE_ENABLED: "1"
       KUGOU_CONTROL_ENABLED: "${KUGOU_CONTROL_ENABLED:-0}"
       KUGOU_ACTIVE_DEVICE_ID: "${KUGOU_ACTIVE_DEVICE_ID:-pc-mumu}"
-      KUGOU_DEVICE_TOKEN_FILE: /run/secrets/kugou-device.secret
+      KUGOU_DEVICES_CONFIG_FILE: /run/config/kugou-devices.json
+    secrets:
+      - source: kugou_pc_token
+        target: kugou-pc.secret
+      - source: kugou_phone_token
+        target: kugou-phone.secret
     volumes:
       - type: bind
-        source: ${KUGOU_DEVICE_TOKEN_FILE_HOST:?set KUGOU_DEVICE_TOKEN_FILE_HOST}
-        target: /run/secrets/kugou-device.secret
+        source: ${KUGOU_DEVICES_CONFIG_FILE_HOST:?set KUGOU_DEVICES_CONFIG_FILE_HOST}
+        target: /run/config/kugou-devices.json
         read_only: true
+
+secrets:
+  kugou_pc_token:
+    file: ${KUGOU_DEVICE_TOKEN_FILE_HOST:?set KUGOU_DEVICE_TOKEN_FILE_HOST}
+  kugou_phone_token:
+    file: ${KUGOU_PHONE_DEVICE_TOKEN_FILE_HOST:?set KUGOU_PHONE_DEVICE_TOKEN_FILE_HOST}

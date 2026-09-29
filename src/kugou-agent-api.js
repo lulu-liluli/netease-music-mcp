@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
+import { isAbsolute } from 'node:path';
 
 import {
   KUGOU_ACK_RESULTS,
@@ -8,6 +9,8 @@ import {
 } from './kugou-bridge.js';
 
 export const KUGOU_AGENT_MAX_BODY_BYTES = 16 * 1024;
+export const KUGOU_DEVICES_CONFIG_MAX_BYTES = 64 * 1024;
+export const KUGOU_DEVICES_CONFIG_MAX_DEVICES = 32;
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,6 +28,19 @@ const PLAYBACK_STATES = new Set([
   'error',
   'connecting',
   'unknown',
+]);
+const CONFIG_ROOT_KEYS = new Set(['version', 'devices']);
+const CONFIG_DEVICE_KEYS = new Set([
+  'device_id',
+  'device_name',
+  'device_type',
+  'token_file',
+]);
+const INLINE_CREDENTIAL_KEYS = new Set([
+  'token',
+  'secret',
+  'password',
+  'authorization',
 ]);
 
 class AgentApiError extends Error {
@@ -326,6 +342,147 @@ export async function readKugouDeviceToken(filePath) {
     throw new Error('酷狗设备 Token 文件内容无效。');
   }
   return token;
+}
+
+function assertConfigObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertOnlyConfigKeys(value, allowedKeys, context) {
+  for (const key of Object.keys(value)) {
+    if (INLINE_CREDENTIAL_KEYS.has(key.toLowerCase())) {
+      throw new Error(`${context}不允许内联凭据字段。`);
+    }
+    if (!allowedKeys.has(key)) {
+      throw new Error(`${context}包含未知字段。`);
+    }
+  }
+}
+
+async function readKugouDevicesConfigJson(filePath) {
+  if (typeof filePath !== 'string' || filePath.trim().length === 0) {
+    throw new Error('必须配置 KUGOU_DEVICES_CONFIG_FILE。');
+  }
+
+  let fileStats;
+  try {
+    fileStats = await stat(filePath);
+  } catch {
+    throw new Error('无法读取酷狗多设备配置文件。');
+  }
+  if (!fileStats.isFile() || fileStats.size > KUGOU_DEVICES_CONFIG_MAX_BYTES) {
+    throw new Error('酷狗多设备配置文件无效或过大。');
+  }
+
+  let raw;
+  try {
+    raw = await readFile(filePath, 'utf8');
+  } catch {
+    throw new Error('无法读取酷狗多设备配置文件。');
+  }
+  if (Buffer.byteLength(raw, 'utf8') > KUGOU_DEVICES_CONFIG_MAX_BYTES) {
+    throw new Error('酷狗多设备配置文件无效或过大。');
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('酷狗多设备配置文件不是有效 JSON。');
+  }
+}
+
+export async function readKugouDevicesConfig(filePath) {
+  const config = await readKugouDevicesConfigJson(filePath);
+  if (!assertConfigObject(config)) {
+    throw new Error('酷狗多设备配置必须是对象。');
+  }
+  assertOnlyConfigKeys(config, CONFIG_ROOT_KEYS, '酷狗多设备配置');
+  if (config.version !== 1) {
+    throw new Error('酷狗多设备配置 version 必须为 1。');
+  }
+  if (
+    !Array.isArray(config.devices) ||
+    config.devices.length < 1 ||
+    config.devices.length > KUGOU_DEVICES_CONFIG_MAX_DEVICES
+  ) {
+    throw new Error('酷狗多设备配置 devices 数量无效。');
+  }
+
+  const deviceIds = new Set();
+  const tokenFiles = new Set();
+  const tokens = new Set();
+  const bridgeDevices = [];
+  const agentDevices = [];
+
+  for (const device of config.devices) {
+    if (!assertConfigObject(device)) {
+      throw new Error('酷狗多设备配置中的设备必须是对象。');
+    }
+    assertOnlyConfigKeys(device, CONFIG_DEVICE_KEYS, '酷狗设备配置');
+    if (
+      typeof device.device_id !== 'string' ||
+      typeof device.device_name !== 'string' ||
+      typeof device.device_type !== 'string' ||
+      typeof device.token_file !== 'string'
+    ) {
+      throw new Error('酷狗设备配置字段无效。');
+    }
+    if (!isAbsolute(device.token_file)) {
+      throw new Error('酷狗设备 token_file 必须是绝对路径。');
+    }
+    if (deviceIds.has(device.device_id)) {
+      throw new Error(`酷狗设备 ID 重复：${device.device_id}`);
+    }
+    if (tokenFiles.has(device.token_file)) {
+      throw new Error('酷狗设备 token_file 重复。');
+    }
+
+    const token = await readKugouDeviceToken(device.token_file);
+    if (tokens.has(token)) {
+      throw new Error('酷狗设备 Token 重复。');
+    }
+
+    const identity = {
+      deviceId: device.device_id,
+      deviceName: device.device_name,
+      deviceType: device.device_type,
+    };
+    deviceIds.add(identity.deviceId);
+    tokenFiles.add(device.token_file);
+    tokens.add(token);
+    bridgeDevices.push(identity);
+    agentDevices.push({ ...identity, token });
+  }
+
+  return { bridgeDevices, agentDevices };
+}
+
+export async function loadKugouDeviceRegistration({
+  devicesConfigFile,
+  deviceTokenFile,
+} = {}) {
+  const multiDeviceFile = String(devicesConfigFile ?? '').trim();
+  const legacyTokenFile = String(deviceTokenFile ?? '').trim();
+  if (multiDeviceFile && legacyTokenFile) {
+    throw new Error(
+      'KUGOU_DEVICES_CONFIG_FILE 与 KUGOU_DEVICE_TOKEN_FILE 不能同时配置。',
+    );
+  }
+  if (multiDeviceFile) {
+    return {
+      mode: 'multi',
+      ...(await readKugouDevicesConfig(multiDeviceFile)),
+    };
+  }
+  if (legacyTokenFile) {
+    return {
+      mode: 'legacy',
+      token: await readKugouDeviceToken(legacyTokenFile),
+    };
+  }
+  throw new Error(
+    '启用酷狗设备桥时必须配置 KUGOU_DEVICES_CONFIG_FILE 或 KUGOU_DEVICE_TOKEN_FILE。',
+  );
 }
 
 export function createKugouAgentApi({

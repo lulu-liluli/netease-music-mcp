@@ -1,17 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { KugouBridge } from '../src/kugou-bridge.js';
 import {
   createKugouAgentApi,
+  KUGOU_DEVICES_CONFIG_MAX_BYTES,
+  KUGOU_DEVICES_CONFIG_MAX_DEVICES,
+  loadKugouDeviceRegistration,
   readKugouDeviceToken,
+  readKugouDevicesConfig,
 } from '../src/kugou-agent-api.js';
 
-const TOKEN = 'a'.repeat(64);
-const PHONE_TOKEN = 'b'.repeat(64);
+const TOKEN = randomBytes(32).toString('hex');
+const PHONE_TOKEN = randomBytes(32).toString('hex');
 const COMMAND_ID = '00000000-0000-4000-8000-000000000001';
 const PHONE_COMMAND_ID = '00000000-0000-4000-8000-000000000002';
 const DEVICES = [
@@ -100,6 +105,43 @@ function request(path, {
   });
 }
 
+async function createConfigFixture(t) {
+  const directory = await mkdtemp(join(tmpdir(), 'kugou-devices-config-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const pcToken = randomBytes(32).toString('hex');
+  const phoneToken = randomBytes(32).toString('hex');
+  const pcTokenFile = join(directory, 'pc.secret');
+  const phoneTokenFile = join(directory, 'phone.secret');
+  const configFile = join(directory, 'devices.json');
+  await writeFile(pcTokenFile, `${pcToken}\n`, 'utf8');
+  await writeFile(phoneTokenFile, `${phoneToken}\n`, 'utf8');
+  return {
+    directory,
+    pcToken,
+    phoneToken,
+    pcTokenFile,
+    phoneTokenFile,
+    configFile,
+    config: {
+      version: 1,
+      devices: [
+        {
+          device_id: 'pc-mumu',
+          device_name: 'Lucy-PC-MuMu',
+          device_type: 'windows_mumu',
+          token_file: pcTokenFile,
+        },
+        {
+          device_id: 'phone',
+          device_name: 'Lucy-Phone',
+          device_type: 'android',
+          token_file: phoneTokenFile,
+        },
+      ],
+    },
+  };
+}
+
 test('reads a device token from a file and does not expose failed paths', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'kugou-token-'));
   const tokenFile = join(directory, 'device.secret');
@@ -117,6 +159,135 @@ test('reads a device token from a file and does not expose failed paths', async 
   await assert.rejects(
     readKugouDeviceToken(missing),
     (error) => !error.message.includes(missing) && !error.message.includes('private-missing'),
+  );
+});
+
+test('loads two runtime token files and maps them to trusted device identities', async (t) => {
+  const fixture = await createConfigFixture(t);
+  const serialized = JSON.stringify(fixture.config);
+  assert.equal(serialized.includes(fixture.pcToken), false);
+  assert.equal(serialized.includes(fixture.phoneToken), false);
+  await writeFile(fixture.configFile, serialized, 'utf8');
+
+  const registration = await loadKugouDeviceRegistration({
+    devicesConfigFile: fixture.configFile,
+  });
+  assert.equal(registration.mode, 'multi');
+  assert.deepEqual(registration.bridgeDevices, DEVICES);
+
+  const bridge = new KugouBridge({ devices: registration.bridgeDevices });
+  const api = createKugouAgentApi({
+    bridge,
+    devices: registration.agentDevices,
+  });
+  assert.deepEqual(
+    api.authenticateAuthorizationHeader(`Bearer ${fixture.pcToken}`),
+    DEVICES[0],
+  );
+  assert.deepEqual(
+    api.authenticateAuthorizationHeader(`Bearer ${fixture.phoneToken}`),
+    DEVICES[1],
+  );
+});
+
+test('strictly rejects invalid multi-device configuration fields and shapes', async (t) => {
+  const fixture = await createConfigFixture(t);
+  const invalidConfigs = [
+    { ...fixture.config, version: 2 },
+    { version: 1, devices: [] },
+    {
+      ...fixture.config,
+      devices: [{ ...fixture.config.devices[0], token: fixture.pcToken }],
+    },
+    {
+      ...fixture.config,
+      devices: [{ ...fixture.config.devices[0], secret: fixture.pcToken }],
+    },
+    {
+      ...fixture.config,
+      devices: [{ ...fixture.config.devices[0], unexpected: true }],
+    },
+    {
+      ...fixture.config,
+      devices: [{ ...fixture.config.devices[0], token_file: 'relative.secret' }],
+    },
+  ];
+
+  for (const [index, config] of invalidConfigs.entries()) {
+    const file = join(fixture.directory, `invalid-${index}.json`);
+    await writeFile(file, JSON.stringify(config), 'utf8');
+    await assert.rejects(readKugouDevicesConfig(file));
+  }
+});
+
+test('rejects oversized configs and excessive device counts', async (t) => {
+  const fixture = await createConfigFixture(t);
+  const oversized = join(fixture.directory, 'oversized.json');
+  await writeFile(oversized, ' '.repeat(KUGOU_DEVICES_CONFIG_MAX_BYTES + 1), 'utf8');
+  await assert.rejects(readKugouDevicesConfig(oversized), /过大/);
+
+  const excessive = join(fixture.directory, 'excessive.json');
+  await writeFile(excessive, JSON.stringify({
+    version: 1,
+    devices: Array.from(
+      { length: KUGOU_DEVICES_CONFIG_MAX_DEVICES + 1 },
+      (_, index) => ({
+        device_id: `device-${index}`,
+        device_name: `Device ${index}`,
+        device_type: 'test',
+        token_file: join(fixture.directory, `token-${index}.secret`),
+      }),
+    ),
+  }), 'utf8');
+  await assert.rejects(readKugouDevicesConfig(excessive), /数量无效/);
+});
+
+test('rejects duplicate device IDs, token files and token values in static config', async (t) => {
+  const fixture = await createConfigFixture(t);
+  const cases = [
+    [
+      { ...fixture.config.devices[0] },
+      { ...fixture.config.devices[1], device_id: 'pc-mumu' },
+    ],
+    [
+      { ...fixture.config.devices[0] },
+      { ...fixture.config.devices[1], token_file: fixture.pcTokenFile },
+    ],
+  ];
+
+  for (const [index, devices] of cases.entries()) {
+    const file = join(fixture.directory, `duplicate-${index}.json`);
+    await writeFile(file, JSON.stringify({ version: 1, devices }), 'utf8');
+    await assert.rejects(readKugouDevicesConfig(file), /重复/);
+  }
+
+  await writeFile(fixture.phoneTokenFile, `${fixture.pcToken}\n`, 'utf8');
+  await writeFile(fixture.configFile, JSON.stringify(fixture.config), 'utf8');
+  await assert.rejects(readKugouDevicesConfig(fixture.configFile), /Token 重复/);
+});
+
+test('keeps legacy registration exclusive and rejects missing bridge credentials', async (t) => {
+  const fixture = await createConfigFixture(t);
+  await writeFile(fixture.configFile, JSON.stringify(fixture.config), 'utf8');
+
+  await assert.rejects(
+    loadKugouDeviceRegistration({
+      devicesConfigFile: fixture.configFile,
+      deviceTokenFile: fixture.pcTokenFile,
+    }),
+    /不能同时配置/,
+  );
+  await assert.rejects(loadKugouDeviceRegistration(), /必须配置/);
+
+  const legacy = await loadKugouDeviceRegistration({
+    deviceTokenFile: fixture.pcTokenFile,
+  });
+  assert.deepEqual(legacy, { mode: 'legacy', token: fixture.pcToken });
+  const bridge = new KugouBridge();
+  const api = createKugouAgentApi({ bridge, token: legacy.token });
+  assert.equal(
+    api.authenticateAuthorizationHeader(`Bearer ${fixture.pcToken}`).deviceId,
+    'pc-mumu',
   );
 });
 
@@ -231,6 +402,14 @@ test('isolates status, claim and ACK by the token-bound device identity', async 
   assert.equal(bridge.getStatus('phone').player.title, 'Phone song');
 
   const pcCommand = bridge.enqueueCommand('next', 'pc-mumu');
+  const phoneCannotClaimPc = await api.fetch(
+    request('/agent/v1/commands/claim', {
+      token: PHONE_TOKEN,
+      body: { protocol_version: 1 },
+    }),
+  );
+  assert.equal(phoneCannotClaimPc.status, 204);
+
   const phoneCommand = bridge.enqueueCommand('previous', 'phone');
   const claimedByPc = await api.fetch(
     request('/agent/v1/commands/claim', {
@@ -252,17 +431,39 @@ test('isolates status, claim and ACK by the token-bound device identity', async 
     result: 'succeeded',
     completed_at: '2026-09-27T12:00:02.000Z',
   };
-  const crossDeviceAck = await api.fetch(
+  const phoneCannotAckPc = await api.fetch(
     request(`/agent/v1/commands/${pcCommand.id}/ack`, {
       token: PHONE_TOKEN,
       body: ackBody,
     }),
   );
-  assert.equal(crossDeviceAck.status, 404);
-  assert.equal((await crossDeviceAck.json()).error, 'command_not_found');
+  assert.equal(phoneCannotAckPc.status, 404);
+  assert.equal((await phoneCannotAckPc.json()).error, 'command_not_found');
+  const pcCannotAckPhone = await api.fetch(
+    request(`/agent/v1/commands/${phoneCommand.id}/ack`, {
+      token: TOKEN,
+      body: ackBody,
+    }),
+  );
+  assert.equal(pcCannotAckPhone.status, 404);
+  assert.equal((await pcCannotAckPhone.json()).error, 'command_not_found');
   assert.equal(
     (await api.fetch(request(`/agent/v1/commands/${pcCommand.id}/ack`, {
       token: TOKEN,
+      body: ackBody,
+    }))).status,
+    200,
+  );
+  assert.equal(
+    (await api.fetch(request('/agent/v1/commands/claim', {
+      token: TOKEN,
+      body: { protocol_version: 1 },
+    }))).status,
+    204,
+  );
+  assert.equal(
+    (await api.fetch(request(`/agent/v1/commands/${phoneCommand.id}/ack`, {
+      token: PHONE_TOKEN,
       body: ackBody,
     }))).status,
     200,

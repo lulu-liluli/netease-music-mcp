@@ -1,10 +1,11 @@
-# Kugou Windows device bridge
+# Kugou device bridge
 
-This optional bridge connects the personal remote MCP service to a Windows
-MuMu instance running Kugou Concept Edition. The server keeps status, agent
-instance lifecycle and commands in per-device in-memory state. The current
-deployment configuration remains backward compatible and registers only one
-device: `pc-mumu` (`Lucy-PC-MuMu`, type `windows_mumu`).
+This optional bridge connects the personal remote MCP service to trusted Kugou
+devices. The server keeps status, agent instance lifecycle and commands in
+per-device in-memory state. The legacy deployment mode remains backward
+compatible and registers only `pc-mumu` (`Lucy-PC-MuMu`, type
+`windows_mumu`). The static multi-device mode can additionally register a
+phone while keeping `pc-mumu` active.
 
 ## Trust boundaries
 
@@ -12,13 +13,12 @@ There are two independent credential layers:
 
 1. OAuth and Personal Access Tokens authorize owner-facing MCP and `/api/v1`
    calls.
-2. A device Bearer token authorizes only `/agent/v1` calls from the Windows
-   agent.
+2. A per-device Bearer token authorizes only `/agent/v1` calls from its bound
+   agent identity.
 
-The device token cannot authorize MCP or user REST operations. OAuth and
-Personal Access Tokens cannot authorize agent routes. The token is read from
-`KUGOU_DEVICE_TOKEN_FILE`; no plaintext-token environment variable is
-supported.
+Device tokens cannot authorize MCP or user REST operations. OAuth and Personal
+Access Tokens cannot authorize agent routes. Tokens are read from secret files;
+no plaintext-token environment variable or inline JSON token is supported.
 
 The Windows agent initiates every HTTPS connection. The cloud service never
 connects to MuMu, Windows or `127.0.0.1:7555`.
@@ -33,27 +33,59 @@ cloud server, enable the bridge with the optional `compose.kugou.yaml` overlay:
 docker compose -f compose.yaml -f compose.kugou.yaml up -d --build
 ```
 
-The host configuration contains only non-secret values:
+The host environment contains only non-secret paths and flags:
 
 ```dotenv
 KUGOU_CONTROL_ENABLED=0
 KUGOU_ACTIVE_DEVICE_ID=pc-mumu
 KUGOU_DEVICE_TOKEN_FILE_HOST=/opt/music-bridge/secrets/kugou-device.secret
+KUGOU_PHONE_DEVICE_TOKEN_FILE_HOST=/opt/music-bridge/secrets/kugou-phone.secret
+KUGOU_DEVICES_CONFIG_FILE_HOST=/opt/music-bridge/config/kugou-devices.json
 ```
 
-`KUGOU_DEVICE_TOKEN_FILE_HOST` is a host file path, not the Token value. The
-file must already exist, remain outside Git, and be readable by the container's
-unprivileged `node` user through the read-only bind mount. The overlay fixes
-the container path at `/run/secrets/kugou-device.secret`; Token content never
-enters Compose environment variables or command-line arguments.
+The two Token variables are host file paths, not Token values. The files must
+already exist and remain outside Git. Compose exposes them read-only inside the
+container as `/run/secrets/kugou-pc.secret` and
+`/run/secrets/kugou-phone.secret`. The configuration file is mounted read-only
+at `/run/config/kugou-devices.json`.
+
+The host configuration file contains identities and container paths only:
+
+```json
+{
+  "version": 1,
+  "devices": [
+    {
+      "device_id": "pc-mumu",
+      "device_name": "Lucy-PC-MuMu",
+      "device_type": "windows_mumu",
+      "token_file": "/run/secrets/kugou-pc.secret"
+    },
+    {
+      "device_id": "phone",
+      "device_name": "Lucy-Phone",
+      "device_type": "android",
+      "token_file": "/run/secrets/kugou-phone.secret"
+    }
+  ]
+}
+```
+
+The JSON file must never contain Token values. `version` must be `1`; only the
+four documented device fields are accepted. Device IDs, Token file paths and
+actual Token values must each be unique, and `token_file` must be absolute.
+The active device must be present in the configured device list. Keep
+`KUGOU_ACTIVE_DEVICE_ID=pc-mumu` until the phone agent is ready; registering an
+offline phone does not affect PC status or control and never triggers fallback.
 
 The first deployment must keep `KUGOU_CONTROL_ENABLED=0`. Verify authenticated
 status reporting, online/offline transitions and `kugou_status` before enabling
 control and recreating the container.
 
-When only the legacy `KUGOU_DEVICE_TOKEN_FILE` configuration is present, the
-server binds that token to `pc-mumu` and uses it as the active device. No
-second device credential is configured by this deployment overlay.
+The server also retains the legacy startup mode. When
+`KUGOU_DEVICES_CONFIG_FILE` is absent and only `KUGOU_DEVICE_TOKEN_FILE` is
+present, that token is bound to `pc-mumu` exactly as before. Setting both
+variables, or setting neither while the bridge is enabled, is a startup error.
 
 This overlay is only for the Ubuntu cloud server. Do not use it to run or
 configure the Windows agent; the agent follows `windows-agent/README.md` and
@@ -147,5 +179,6 @@ reported, or while control is disabled.
   queue.
 - An ACK confirms that the local ADB operation completed, not that the Kugou UI
   necessarily changed as expected.
-- The Windows agent is the only configured and supported companion in this
-  deployment version. There is no Android phone companion or phone credential.
+- Static registration does not provide an Android agent. Until a phone agent is
+  separately implemented and provisioned, the registered phone remains
+  `never_seen` and offline.
