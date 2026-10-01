@@ -69,6 +69,10 @@ function publicCommand(command) {
 }
 
 export class KugouBridge {
+  #eventAdapter;
+  #eventQueue;
+  #onEventError;
+
   constructor({
     controlEnabled = false,
     devices = [LEGACY_KUGOU_DEVICE],
@@ -79,7 +83,23 @@ export class KugouBridge {
     commandTtlMs = DEFAULT_COMMAND_TTL_MS,
     maxPendingCommands = DEFAULT_MAX_PENDING_COMMANDS,
     terminalRetentionMs = DEFAULT_TERMINAL_RETENTION_MS,
+    eventAdapter,
+    eventQueue,
+    onEventError,
   } = {}) {
+    if ((eventAdapter == null) !== (eventQueue == null)) {
+      throw new TypeError('eventAdapter and eventQueue must be provided together.');
+    }
+    if (
+      eventAdapter != null &&
+      (typeof eventAdapter.accept !== 'function' ||
+        typeof eventQueue.enqueue !== 'function')
+    ) {
+      throw new TypeError('eventAdapter.accept and eventQueue.enqueue must be functions.');
+    }
+    if (onEventError !== undefined && typeof onEventError !== 'function') {
+      throw new TypeError('onEventError must be a function.');
+    }
     if (!Array.isArray(devices) || devices.length < 1) {
       throw new Error('至少需要配置一个酷狗设备。');
     }
@@ -103,6 +123,9 @@ export class KugouBridge {
     this.commandTtlMs = commandTtlMs;
     this.maxPendingCommands = maxPendingCommands;
     this.terminalRetentionMs = terminalRetentionMs;
+    this.#eventAdapter = eventAdapter;
+    this.#eventQueue = eventQueue;
+    this.#onEventError = onEventError;
   }
 
   serverTime() {
@@ -152,25 +175,76 @@ export class KugouBridge {
 
   recordStatus(deviceId, report) {
     const device = this.cleanup(deviceId);
-    const current = device.latestStatus;
+    const previousStatus = device.latestStatus;
     if (device.retiredAgentInstances.has(report.agent_instance_id)) {
       return { accepted: false, reason: 'retired_agent_instance' };
     }
-    if (current?.agent_instance_id === report.agent_instance_id) {
-      if (report.sequence <= current.sequence) {
+    if (previousStatus?.agent_instance_id === report.agent_instance_id) {
+      if (report.sequence <= previousStatus.sequence) {
         return { accepted: false, reason: 'stale_sequence' };
       }
-    } else if (current) {
-      device.retiredAgentInstances.add(current.agent_instance_id);
+    } else if (previousStatus) {
+      device.retiredAgentInstances.add(previousStatus.agent_instance_id);
     }
 
-    device.latestStatus = {
+    const receivedAt = this.now();
+    const currentStatus = {
       ...report,
       capabilities: [...report.capabilities],
       player: report.player ? { ...report.player } : null,
-      receivedAt: this.now(),
+      receivedAt,
     };
+    device.latestStatus = currentStatus;
+
+    if (this.#eventAdapter != null) {
+      const context = {
+        deviceId: device.deviceId,
+        agentInstanceId: currentStatus.agent_instance_id,
+        sequence: currentStatus.sequence,
+      };
+      let events;
+      try {
+        events = this.#eventAdapter.accept({
+          device: {
+            deviceId: device.deviceId,
+            deviceName: device.deviceName,
+            deviceType: device.deviceType,
+          },
+          previousStatus,
+          currentStatus,
+          receivedAt,
+        });
+        if (!Array.isArray(events)) {
+          throw new TypeError('eventAdapter.accept must return an array.');
+        }
+      } catch (error) {
+        this.#reportEventError(error, { phase: 'adapter', ...context });
+        return { accepted: true };
+      }
+      for (const event of events) {
+        try {
+          this.#eventQueue.enqueue(event);
+        } catch (error) {
+          this.#reportEventError(error, {
+            phase: 'enqueue',
+            ...context,
+            eventId: event?.id,
+          });
+          break;
+        }
+      }
+    }
     return { accepted: true };
+  }
+
+  #reportEventError(error, context) {
+    // Until service wiring supplies a handler, event errors stay isolated from status.
+    if (!this.#onEventError) return;
+    try {
+      this.#onEventError(error, context);
+    } catch {
+      // A failing observer must not interrupt the accepted status report.
+    }
   }
 
   getStatus(deviceId = this.activeDeviceId) {

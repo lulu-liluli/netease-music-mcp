@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { KugouBridge, KugouBridgeError } from '../src/kugou-bridge.js';
+import { KugouPlaybackEventAdapter } from '../src/kugou-events.js';
+import { KugouEventQueue } from '../src/kugou-event-queue.js';
 
 const IDS = [
   '00000000-0000-4000-8000-000000000001',
@@ -57,6 +59,35 @@ function setup(options = {}) {
     advance(milliseconds) {
       now += milliseconds;
     },
+  };
+}
+
+function playbackStatus({
+  agentInstanceId = '10000000-0000-4000-8000-000000000001',
+  sequence = 1,
+  title = 'Song A',
+  playbackState = 'playing',
+  positionMs = 12_300,
+} = {}) {
+  return status({
+    agent_instance_id: agentInstanceId,
+    sequence,
+    player: {
+      ...status().player,
+      title,
+      playback_state: playbackState,
+      position_ms: positionMs,
+    },
+  });
+}
+
+function setupWithEvents(options = {}) {
+  const eventQueue = new KugouEventQueue();
+  const eventAdapter = new KugouPlaybackEventAdapter();
+  return {
+    ...setup({ eventAdapter, eventQueue, ...options }),
+    eventAdapter,
+    eventQueue,
   };
 }
 
@@ -343,4 +374,270 @@ test('uses the required default limit of 20 pending commands', () => {
     () => bridge.enqueueCommand('next'),
     (error) => error.code === 'queue_full',
   );
+});
+
+test('event dependencies are optional but must be supplied together', () => {
+  const { bridge } = setup();
+  assert.deepEqual(bridge.recordStatus('pc-mumu', playbackStatus()), {
+    accepted: true,
+  });
+  assert.equal(bridge.getStatus().player.title, 'Song A');
+
+  assert.throws(
+    () => setup({ eventAdapter: new KugouPlaybackEventAdapter() }),
+    /eventAdapter and eventQueue/,
+  );
+  assert.throws(
+    () => setup({ eventQueue: new KugouEventQueue() }),
+    /eventAdapter and eventQueue/,
+  );
+  assert.throws(
+    () => setup({ eventAdapter: {}, eventQueue: new KugouEventQueue() }),
+    /eventAdapter.accept and eventQueue.enqueue/,
+  );
+});
+
+test('accepted reports pass trusted identity and real status snapshots to Adapter', () => {
+  const calls = [];
+  const eventAdapter = { accept: (input) => { calls.push(input); return []; } };
+  const { bridge } = setup({ eventAdapter, eventQueue: new KugouEventQueue() });
+  const first = playbackStatus();
+  const second = playbackStatus({ sequence: 2, title: 'Song B' });
+
+  assert.deepEqual(bridge.recordStatus('pc-mumu', first), { accepted: true });
+  assert.deepEqual(bridge.recordStatus('pc-mumu', second), { accepted: true });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].device, DEVICES[0]);
+  assert.equal(calls[0].previousStatus, null);
+  assert.equal(calls[0].receivedAt, 1_000_000);
+  assert.equal(calls[0].currentStatus.receivedAt, calls[0].receivedAt);
+  assert.notStrictEqual(calls[0].currentStatus, first);
+  assert.notStrictEqual(calls[0].currentStatus.player, first.player);
+  assert.notStrictEqual(calls[0].currentStatus.capabilities, first.capabilities);
+  assert.strictEqual(calls[1].previousStatus, calls[0].currentStatus);
+  assert.strictEqual(calls[1].currentStatus, bridge.getDeviceRuntime('pc-mumu').latestStatus);
+  assert.equal(Object.hasOwn(calls[1].previousStatus, 'online'), false);
+  assert.deepEqual(bridge.getStatus().player.title, 'Song B');
+});
+
+test('event baseline, track changes, heartbeat and position rules integrate', () => {
+  const { bridge, eventQueue } = setupWithEvents();
+  const reports = [
+    playbackStatus(),
+    playbackStatus({ sequence: 2, title: 'Song B' }),
+    playbackStatus({ sequence: 3, title: 'Song B' }),
+    playbackStatus({ sequence: 4, title: 'Song B', positionMs: 25_000 }),
+  ];
+
+  assert.deepEqual(bridge.recordStatus('pc-mumu', reports[0]), { accepted: true });
+  assert.equal(eventQueue.size(), 0);
+  assert.deepEqual(bridge.recordStatus('pc-mumu', reports[1]), { accepted: true });
+  assert.deepEqual(eventQueue.getState().pending.map((event) => event.eventType), [
+    'track_changed',
+  ]);
+  bridge.recordStatus('pc-mumu', reports[2]);
+  bridge.recordStatus('pc-mumu', reports[3]);
+  assert.equal(eventQueue.size(), 1);
+
+  bridge.recordStatus('pc-mumu', playbackStatus({ sequence: 5, title: 'Song C' }));
+  assert.deepEqual(eventQueue.getState().pending.map((event) => event.current.track.title), [
+    'Song C',
+  ]);
+  assert.deepEqual(eventQueue.getState().superseded.map((event) => event.current.track.title), [
+    'Song B',
+  ]);
+});
+
+test('playback pause and resume events retain Queue latest-wins behavior', () => {
+  const { bridge, eventQueue } = setupWithEvents();
+  bridge.recordStatus('pc-mumu', playbackStatus());
+  bridge.recordStatus('pc-mumu', playbackStatus({ sequence: 2, playbackState: 'paused' }));
+  assert.deepEqual(eventQueue.getState().pending.map((event) => event.eventType), [
+    'playback_paused',
+  ]);
+
+  bridge.recordStatus('pc-mumu', playbackStatus({ sequence: 3, playbackState: 'playing' }));
+  assert.deepEqual(eventQueue.getState().pending.map((event) => event.eventType), [
+    'playback_resumed',
+  ]);
+  assert.deepEqual(eventQueue.getState().superseded.map((event) => event.eventType), [
+    'playback_paused',
+  ]);
+});
+
+test('stale and retired reports never reach Adapter or Queue', () => {
+  const eventQueue = new KugouEventQueue();
+  const realAdapter = new KugouPlaybackEventAdapter();
+  let adapterCalls = 0;
+  const eventAdapter = {
+    accept(input) {
+      adapterCalls += 1;
+      return realAdapter.accept(input);
+    },
+  };
+  const { bridge } = setup({ eventAdapter, eventQueue });
+  bridge.recordStatus('pc-mumu', playbackStatus());
+  bridge.recordStatus('pc-mumu', playbackStatus({ sequence: 2, title: 'Song B' }));
+  assert.equal(adapterCalls, 2);
+  assert.equal(eventQueue.size(), 1);
+
+  assert.deepEqual(
+    bridge.recordStatus('pc-mumu', playbackStatus({ sequence: 2, title: 'Song C' })),
+    { accepted: false, reason: 'stale_sequence' },
+  );
+  assert.equal(adapterCalls, 2);
+  assert.equal(eventQueue.size(), 1);
+
+  const agentB = '20000000-0000-4000-8000-000000000002';
+  bridge.recordStatus('pc-mumu', playbackStatus({
+    agentInstanceId: agentB,
+    sequence: 0,
+    title: 'Song C',
+  }));
+  assert.equal(adapterCalls, 3);
+  assert.deepEqual(
+    bridge.recordStatus('pc-mumu', playbackStatus({ sequence: 3, title: 'Song D' })),
+    { accepted: false, reason: 'retired_agent_instance' },
+  );
+  assert.equal(adapterCalls, 3);
+  assert.equal(eventQueue.size(), 1);
+});
+
+test('new Agent instance starts a baseline before its own track transition', () => {
+  const { bridge, eventQueue } = setupWithEvents();
+  const agentB = '20000000-0000-4000-8000-000000000002';
+  bridge.recordStatus('pc-mumu', playbackStatus({ title: 'Song A' }));
+  assert.deepEqual(bridge.recordStatus('pc-mumu', playbackStatus({
+    agentInstanceId: agentB,
+    sequence: 0,
+    title: 'Song B',
+    playbackState: 'paused',
+  })), { accepted: true });
+  assert.equal(eventQueue.size(), 0);
+
+  bridge.recordStatus('pc-mumu', playbackStatus({
+    agentInstanceId: agentB,
+    sequence: 1,
+    title: 'Song C',
+    playbackState: 'paused',
+  }));
+  assert.deepEqual(eventQueue.getState().pending.map((event) => event.eventType), [
+    'track_changed',
+  ]);
+  assert.equal(eventQueue.getState().pending[0].previous.track.title, 'Song B');
+  assert.equal(eventQueue.getState().pending[0].current.track.title, 'Song C');
+});
+
+test('one accepted report enqueues track and playback events in Adapter order', () => {
+  const { bridge, eventQueue } = setupWithEvents();
+  bridge.recordStatus('pc-mumu', playbackStatus({ playbackState: 'paused' }));
+  bridge.recordStatus('pc-mumu', playbackStatus({
+    sequence: 2,
+    title: 'Song B',
+    playbackState: 'playing',
+  }));
+
+  const pending = eventQueue.getState().pending;
+  assert.deepEqual(pending.map((event) => event.eventType), [
+    'track_changed',
+    'playback_resumed',
+  ]);
+  assert.deepEqual(pending.map((event) => event.stateKey), [
+    'kugou:pc-mumu:track',
+    'kugou:pc-mumu:playback',
+  ]);
+});
+
+test('Adapter failure is observable while the accepted status remains available', () => {
+  const failure = new Error('adapter failed');
+  const errors = [];
+  const eventAdapter = { accept() { throw failure; } };
+  const eventQueue = new KugouEventQueue();
+  const { bridge } = setup({
+    eventAdapter,
+    eventQueue,
+    onEventError: (error, context) => errors.push({ error, context }),
+  });
+  const report = playbackStatus({ title: 'private-title' });
+  report.token = 'private-token';
+
+  assert.deepEqual(bridge.recordStatus('pc-mumu', report), { accepted: true });
+  assert.equal(bridge.getStatus().player.title, 'private-title');
+  assert.equal(eventQueue.size(), 0);
+  assert.strictEqual(errors[0].error, failure);
+  assert.deepEqual(errors[0].context, {
+    phase: 'adapter',
+    deviceId: 'pc-mumu',
+    agentInstanceId: report.agent_instance_id,
+    sequence: report.sequence,
+  });
+  assert.equal(JSON.stringify(errors[0].context).includes('private'), false);
+  assert.equal(errors.length, 1);
+});
+
+test('enqueue failure reports event ID and does not roll back earlier events', () => {
+  const failure = new Error('queue failed');
+  const first = { id: 'track-event' };
+  const second = { id: 'playback-event' };
+  const enqueued = [];
+  const errors = [];
+  const eventQueue = {
+    enqueue(event) {
+      if (event.id === second.id) throw failure;
+      enqueued.push(event.id);
+    },
+  };
+  const { bridge } = setup({
+    eventAdapter: { accept: () => [first, second] },
+    eventQueue,
+    onEventError: (error, context) => errors.push({ error, context }),
+  });
+
+  assert.deepEqual(bridge.recordStatus('pc-mumu', playbackStatus()), {
+    accepted: true,
+  });
+  assert.deepEqual(enqueued, ['track-event']);
+  assert.equal(bridge.getStatus().online, true);
+  assert.strictEqual(errors[0].error, failure);
+  assert.deepEqual(errors[0].context, {
+    phase: 'enqueue',
+    deviceId: 'pc-mumu',
+    agentInstanceId: '10000000-0000-4000-8000-000000000001',
+    sequence: 1,
+    eventId: 'playback-event',
+  });
+  assert.equal(errors.length, 1);
+});
+
+test('event errors remain isolated without a handler or with a failing handler', () => {
+  const eventAdapter = { accept() { throw new Error('event failure'); } };
+  const withoutHandler = setup({ eventAdapter, eventQueue: new KugouEventQueue() }).bridge;
+  assert.deepEqual(withoutHandler.recordStatus('pc-mumu', playbackStatus()), {
+    accepted: true,
+  });
+
+  const withFailingHandler = setup({
+    eventAdapter,
+    eventQueue: new KugouEventQueue(),
+    onEventError() { throw new Error('observer failure'); },
+  }).bridge;
+  assert.deepEqual(withFailingHandler.recordStatus('pc-mumu', playbackStatus()), {
+    accepted: true,
+  });
+});
+
+test('invalid Adapter output is reported without interrupting status', () => {
+  const errors = [];
+  const { bridge } = setup({
+    eventAdapter: { accept: () => null },
+    eventQueue: new KugouEventQueue(),
+    onEventError: (error, context) => errors.push({ error, context }),
+  });
+
+  assert.deepEqual(bridge.recordStatus('pc-mumu', playbackStatus()), {
+    accepted: true,
+  });
+  assert.equal(bridge.getStatus().online, true);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].context.phase, 'adapter');
 });
