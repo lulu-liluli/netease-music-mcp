@@ -3,6 +3,7 @@
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
+import { finished, pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -15,6 +16,8 @@ import {
 import { PersonalAuthStore, parseMasterKey } from './personal-store.js';
 import { createNeteaseMcpServer } from './mcp-server.js';
 import { KugouBridge } from './kugou-bridge.js';
+import { KugouEventQueue } from './kugou-event-queue.js';
+import { KugouPlaybackEventAdapter } from './kugou-events.js';
 import {
   createKugouAgentApi,
   loadKugouDeviceRegistration,
@@ -40,6 +43,41 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_FORM_BYTES = 64 * 1024;
 const DEFAULT_HTML_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+function reportKugouEventError(error, context) {
+  let phase = 'unknown';
+  let deviceId = 'unknown';
+  let classification = 'unknown_error';
+
+  try {
+    if (context?.phase === 'adapter' || context?.phase === 'enqueue') {
+      phase = context.phase;
+    }
+    if (
+      typeof context?.deviceId === 'string' &&
+      /^[A-Za-z0-9._:-]{1,80}$/.test(context.deviceId)
+    ) {
+      deviceId = context.deviceId;
+    }
+    if (error instanceof TypeError) {
+      classification = 'type_error';
+    } else if (error instanceof RangeError) {
+      classification = 'range_error';
+    } else if (error instanceof Error) {
+      classification = 'event_error';
+    }
+  } catch {
+    // Keep the observer safe even for malformed error/context objects.
+  }
+
+  try {
+    console.error(
+      `[kugou-event] phase=${phase} device_id=${deviceId} error=${classification}`,
+    );
+  } catch {
+    // Logging failures must not interrupt an accepted Agent status report.
+  }
+}
 
 function json(response, status, data, headers = {}) {
   response.writeHead(status, {
@@ -164,7 +202,52 @@ async function readBody(request, limit = MAX_BODY_BYTES) {
   return Buffer.concat(chunks);
 }
 
-const KUGOU_SECURITY_SCHEME_TOOLS = new Set(['kugou_status', 'kugou_control']);
+function isAbortError(error) {
+  return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+}
+
+function isExpectedMcpCancellation(error) {
+  return isAbortError(error) || error?.code === 'CONNECTION_CLOSED';
+}
+
+function createMcpRequestLifecycle(request, response) {
+  const controller = new AbortController();
+  let responseFinished = false;
+
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  const onRequestAborted = () => abort();
+  const onResponseFinish = () => {
+    responseFinished = true;
+  };
+  const onResponseClose = () => {
+    if (!responseFinished && !response.writableFinished) abort();
+  };
+
+  request.on('aborted', onRequestAborted);
+  response.on('finish', onResponseFinish);
+  response.on('close', onResponseClose);
+  if (request.aborted || response.destroyed) abort();
+
+  return {
+    signal: controller.signal,
+    abort,
+    shutdown() {
+      abort();
+      if (!response.destroyed) response.destroy();
+    },
+    cleanup() {
+      request.off('aborted', onRequestAborted);
+      response.off('finish', onResponseFinish);
+      response.off('close', onResponseClose);
+    },
+  };
+}
+
+const KUGOU_SECURITY_SCHEME_TOOLS = new Set([
+  'kugou_status', 'kugou_control', 'kugou_wait', 'kugou_wait_ack',
+]);
 
 function isSingleToolsListRequest(body) {
   if (!body) return false;
@@ -507,6 +590,7 @@ export async function createPersonalNeteaseServer({
   origin,
   store,
   kugouBridge,
+  kugouEventQueue,
   kugouAgentApi,
   allowedCorsOrigins = [],
   onError = (error) => console.error(`[netease-personal] ${error.message}`),
@@ -567,6 +651,7 @@ export async function createPersonalNeteaseServer({
       return createNeteaseMcpServer({
         authInfo,
         kugouBridge,
+        kugouEventQueue,
         resourceMetadataUrl: metadataUrl,
         accountContext: userId
           ? {
@@ -576,8 +661,61 @@ export async function createPersonalNeteaseServer({
           : undefined,
       });
     },
-    { legacy: 'stateless', responseMode: 'auto', onerror: onError },
+    {
+      legacy: 'stateless',
+      responseMode: 'auto',
+      onerror: (error) => {
+        if (!isExpectedMcpCancellation(error)) onError(error);
+      },
+    },
   );
+  const activeMcpRequests = new Set();
+
+  async function handleMcpRequest(request, response) {
+    const lifecycle = createMcpRequestLifecycle(request, response);
+    activeMcpRequests.add(lifecycle);
+    try {
+      if (!['POST', 'GET', 'DELETE'].includes(request.method ?? '')) {
+        await writeWebResponse(
+          new Response(null, {
+            status: 405,
+            headers: { allow: 'POST, GET, DELETE' },
+          }),
+          response,
+          lifecycle.signal,
+        );
+        return;
+      }
+      const body = ['GET', 'HEAD'].includes(request.method ?? '')
+        ? undefined
+        : await readBody(request);
+      if (lifecycle.signal.aborted) return;
+
+      const mcpRequest = toWebRequest(request, resource, body, lifecycle.signal);
+      const authInfo = await mcpAuthGate(mcpRequest);
+      if (authInfo instanceof Response) {
+        await writeWebResponse(authInfo, response, lifecycle.signal);
+        return;
+      }
+      const mcpResponse = await mcpHandler.fetch(mcpRequest, { authInfo });
+      const finalResponse = isSingleToolsListRequest(body)
+        ? await adaptToolsListResponse(mcpResponse)
+        : mcpResponse;
+      await writeWebResponse(finalResponse, response, lifecycle.signal);
+    } catch (error) {
+      if (
+        lifecycle.signal.aborted ||
+        response.destroyed ||
+        isAbortError(error)
+      ) {
+        return;
+      }
+      throw error;
+    } finally {
+      lifecycle.cleanup();
+      activeMcpRequests.delete(lifecycle);
+    }
+  }
 
   function accountOptions(userId) {
     return {
@@ -1067,25 +1205,7 @@ export async function createPersonalNeteaseServer({
       }
 
       if (pathname === '/mcp') {
-        if (!['POST', 'GET', 'DELETE'].includes(request.method ?? '')) {
-          response.writeHead(405, { allow: 'POST, GET, DELETE' });
-          response.end();
-          return;
-        }
-        const body = ['GET', 'HEAD'].includes(request.method ?? '')
-          ? undefined
-          : await readBody(request);
-        const mcpRequest = toWebRequest(request, resource, body);
-        const authInfo = await mcpAuthGate(mcpRequest);
-        if (authInfo instanceof Response) {
-          await writeWebResponse(authInfo, response);
-          return;
-        }
-        const mcpResponse = await mcpHandler.fetch(mcpRequest, { authInfo });
-        const finalResponse = isSingleToolsListRequest(body)
-          ? await adaptToolsListResponse(mcpResponse)
-          : mcpResponse;
-        await writeWebResponse(finalResponse, response);
+        await handleMcpRequest(request, response);
         return;
       }
 
@@ -1208,10 +1328,11 @@ export async function createPersonalNeteaseServer({
     httpServer,
     resource,
     close: async () => {
-      await mcpHandler.close();
-      await new Promise((resolve, reject) => {
+      const serverClosed = new Promise((resolve, reject) => {
         httpServer.close((error) => (error ? reject(error) : resolve()));
       });
+      for (const lifecycle of activeMcpRequests) lifecycle.shutdown();
+      await Promise.all([mcpHandler.close(), serverClosed]);
     },
   };
 }
@@ -1241,7 +1362,7 @@ async function validateAuthorizationRequest(url, store, resource) {
   return client;
 }
 
-function toWebRequest(request, overrideUrl, body) {
+function toWebRequest(request, overrideUrl, body, signal) {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers)) {
     if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(', ') : value);
@@ -1250,19 +1371,38 @@ function toWebRequest(request, overrideUrl, body) {
     method: request.method,
     headers,
     body: body ?? (['GET', 'HEAD'].includes(request.method ?? '') ? undefined : undefined),
+    signal,
   });
 }
 
-async function writeWebResponse(webResponse, response) {
+async function writeWebResponse(webResponse, response, signal) {
+  if (response.destroyed || response.writableEnded) {
+    try {
+      await webResponse.body?.cancel();
+    } catch {
+      // The connection is already gone; cancellation is best-effort cleanup.
+    }
+    return;
+  }
   const headers = Object.fromEntries(webResponse.headers.entries());
   headers['cache-control'] = 'no-store';
   headers['x-content-type-options'] = 'nosniff';
-  response.writeHead(webResponse.status, headers);
+  try {
+    response.writeHead(webResponse.status, headers);
+  } catch (error) {
+    try {
+      await webResponse.body?.cancel();
+    } catch {
+      // Preserve the original write failure.
+    }
+    throw error;
+  }
   if (!webResponse.body) {
     response.end();
+    await finished(response, { cleanup: true, signal });
     return;
   }
-  Readable.fromWeb(webResponse.body).pipe(response);
+  await pipeline(Readable.fromWeb(webResponse.body), response, { signal });
 }
 
 function readFeatureFlag(name) {
@@ -1291,6 +1431,7 @@ async function main() {
   const kugouBridgeEnabled = readFeatureFlag('KUGOU_BRIDGE_ENABLED');
   const kugouControlEnabled = readFeatureFlag('KUGOU_CONTROL_ENABLED');
   let kugouBridge;
+  let kugouEventQueue;
   let kugouAgentApi;
   if (kugouBridgeEnabled) {
     const registration = await loadKugouDeviceRegistration({
@@ -1300,9 +1441,14 @@ async function main() {
     const activeDeviceId = String(
       process.env.KUGOU_ACTIVE_DEVICE_ID ?? 'pc-mumu',
     ).trim();
+    const eventAdapter = new KugouPlaybackEventAdapter();
+    kugouEventQueue = new KugouEventQueue();
     kugouBridge = new KugouBridge({
       controlEnabled: kugouControlEnabled,
       activeDeviceId,
+      eventAdapter,
+      eventQueue: kugouEventQueue,
+      onEventError: reportKugouEventError,
       ...(registration.mode === 'multi'
         ? { devices: registration.bridgeDevices }
         : {}),
@@ -1318,6 +1464,7 @@ async function main() {
     origin,
     store,
     kugouBridge,
+    kugouEventQueue,
     kugouAgentApi,
     allowedCorsOrigins: String(process.env.NETEASE_PERSONAL_CORS_ORIGINS ?? '')
       .split(',')

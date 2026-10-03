@@ -545,7 +545,11 @@ test('a second concurrent wait is rejected until the first completes', async () 
 
   await assert.rejects(
     queue.waitNext({ timeoutMs: 100 }),
-    /already has an active waiter/,
+    {
+      name: 'Error',
+      message: 'KugouEventQueue already has an active waiter.',
+      code: 'waiter_busy',
+    },
   );
 
   queue.enqueue(stateEvent({ id: 'event-a' }));

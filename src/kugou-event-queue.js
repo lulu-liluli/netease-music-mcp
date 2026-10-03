@@ -269,7 +269,9 @@ export class KugouEventQueue {
       throw abortError();
     }
     if (this.#waiter) {
-      throw new Error('KugouEventQueue already has an active waiter.');
+      const error = new Error('KugouEventQueue already has an active waiter.');
+      error.code = 'waiter_busy';
+      throw error;
     }
 
     const reserveOptions = deviceId === null ? {} : { deviceId };

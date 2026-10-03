@@ -82,10 +82,93 @@ async function handle(operation) {
   }
 }
 
+const KUGOU_EVENT_ERRORS = {
+  invalid_params: '等待工具参数无效。',
+  insufficient_scope: '当前 Token 缺少 music:read 权限。',
+  waiter_busy: '已有酷狗事件等待请求，请在其结束后重试。',
+  cancelled: '酷狗事件等待已取消。',
+  signal_unavailable: '请求取消信号不可用。',
+  stale_reservation: '事件预留凭据已失效。',
+  reservation_required: '确认事件需要完整预留凭据。',
+  unknown_event: '事件不存在或已过期。',
+  invalid_state: '事件当前无法确认。',
+  internal_error: '酷狗事件操作失败。',
+};
+const kugouEventErrorSchema = z.object({
+  outcome: z.literal('error'),
+  error: z.object({
+    code: z.enum(Object.keys(KUGOU_EVENT_ERRORS)),
+    message: z.string(),
+  }),
+});
+const kugouTrackSchema = z.object({
+  title: z.string(),
+  artist: z.string(),
+  album: z.string(),
+});
+const kugouEventFields = {
+  id: z.string(),
+  device: z.object({
+    deviceId: z.string(),
+    deviceName: z.string(),
+    deviceType: z.string(),
+  }),
+  createdAt: z.string(),
+  observedAt: z.string(),
+};
+// Zod object parsing allowlists fields at every level, including track metadata.
+const publicKugouEventSchema = z.discriminatedUnion('eventType', [
+  z.object({
+    ...kugouEventFields,
+    eventType: z.literal('track_changed'),
+    previous: z.object({ track: kugouTrackSchema }),
+    current: z.object({ track: kugouTrackSchema }),
+  }),
+  ...['playback_paused', 'playback_resumed'].map((eventType) => z.object({
+    ...kugouEventFields,
+    eventType: z.literal(eventType),
+    previous: z.object({ playbackState: z.enum(['playing', 'paused']) }),
+    current: z.object({ playbackState: z.enum(['playing', 'paused']) }),
+  })),
+]);
+
+function kugouEventResult(data, text, isError = false) {
+  return {
+    structuredContent: data,
+    content: [{ type: 'text', text }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function kugouEventFailure(code) {
+  const message = KUGOU_EVENT_ERRORS[code];
+  return kugouEventResult(
+    { outcome: 'error', error: { code, message } },
+    `${code}: ${message}`,
+    true,
+  );
+}
+
+function structuredInputSchema(schema) {
+  // The SDK otherwise turns validation failures into text-only errors. Preserve
+  // its real Standard Schema JSON contract and pass an invalid sentinel so the
+  // handler can return a sanitized structured error without echoing input.
+  return {
+    '~standard': {
+      ...schema['~standard'],
+      validate(value) {
+        const parsed = schema.safeParse(value);
+        return { value: parsed.success ? parsed.data : null };
+      },
+    },
+  };
+}
+
 export function createNeteaseMcpServer({
   authInfo,
   accountContext,
   kugouBridge,
+  kugouEventQueue,
   resourceMetadataUrl,
 } = {}) {
   const accountOptions = accountContext
@@ -99,6 +182,21 @@ export function createNeteaseMcpServer({
       return insufficientScopeFailure(scope, resourceMetadataUrl);
     }
     return handle(operation);
+  };
+  const guardedEvent = async (operation) => {
+    if (authInfo && !authInfo.scopes.includes('music:read')) {
+      const denied = insufficientScopeFailure('music:read', resourceMetadataUrl);
+      return { ...kugouEventFailure('insufficient_scope'), _meta: denied._meta };
+    }
+    try {
+      return await operation();
+    } catch (error) {
+      return kugouEventFailure(
+        error?.code === 'waiter_busy'
+          ? 'waiter_busy'
+          : error?.name === 'AbortError' ? 'cancelled' : 'internal_error',
+      );
+    }
   };
   const server = new McpServer(
     {
@@ -252,6 +350,112 @@ export function createNeteaseMcpServer({
       async ({ action }) =>
         guarded('player:control', () => kugouBridge.enqueueCommand(action)),
     );
+
+    if (kugouEventQueue) {
+      server.registerTool(
+        'kugou_wait',
+        {
+          title: '等待当前活动酷狗设备事件',
+          description:
+            '等待并预留一条当前活动设备事件；超时为正常结果。处理事件后需用事件 id 和完整 receiptToken 调用 kugou_wait_ack；本工具不会自动确认事件。',
+          inputSchema: structuredInputSchema(z.strictObject({
+            timeout_ms: z.number().int().min(1).max(45_000).default(30_000),
+          })),
+          outputSchema: z.discriminatedUnion('outcome', [
+            z.object({
+              outcome: z.literal('event'),
+              event: publicKugouEventSchema,
+              reservation: z.object({
+                receiptToken: z.string(),
+                leaseExpiresAt: z.number(),
+              }),
+            }),
+            z.object({ outcome: z.literal('timeout') }),
+            kugouEventErrorSchema,
+          ]),
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+          },
+          _meta: { securitySchemes: oauthSecuritySchemes(['music:read']) },
+        },
+        async (args, ctx) => {
+          const deviceId = kugouBridge.activeDeviceId;
+          return guardedEvent(async () => {
+            if (args === null) return kugouEventFailure('invalid_params');
+            const signal = ctx.mcpReq.signal;
+            if (!signal) return kugouEventFailure('signal_unavailable');
+            const reservation = await kugouEventQueue.waitNext({
+              deviceId,
+              timeoutMs: args.timeout_ms,
+              signal,
+            });
+            if (signal.aborted) {
+              if (reservation) {
+                kugouEventQueue.release(reservation.event.id, reservation.receiptToken);
+              }
+              return kugouEventFailure('cancelled');
+            }
+            if (!reservation) {
+              return kugouEventResult({ outcome: 'timeout' }, '等待超时，暂无酷狗事件。');
+            }
+            return kugouEventResult({
+              outcome: 'event',
+              event: publicKugouEventSchema.parse(reservation.event),
+              reservation: {
+                receiptToken: reservation.receiptToken,
+                leaseExpiresAt: reservation.leaseExpiresAt,
+              },
+            }, '已预留酷狗事件，请处理后使用完整 receiptToken 确认。');
+          });
+        },
+      );
+
+      server.registerTool(
+        'kugou_wait_ack',
+        {
+          title: '确认已处理的酷狗事件',
+          description: '使用事件 id 和完整 receiptToken 确认事件；不会控制设备播放。',
+          inputSchema: structuredInputSchema(z.strictObject({
+            eventId: z.string().min(1).max(256),
+            receiptToken: z.string().max(256),
+          })),
+          outputSchema: z.discriminatedUnion('outcome', [
+            z.object({
+              outcome: z.literal('acknowledged'),
+              eventId: z.string(),
+              acknowledged: z.literal(true),
+              alreadyAcknowledged: z.boolean(),
+            }),
+            kugouEventErrorSchema,
+          ]),
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+          },
+          _meta: { securitySchemes: oauthSecuritySchemes(['music:read']) },
+        },
+        async (args) => guardedEvent(() => {
+          if (args === null) return kugouEventFailure('invalid_params');
+          const result = kugouEventQueue.ack(args.eventId, args.receiptToken);
+          if (!result.acknowledged) {
+            const code = ['stale_reservation', 'reservation_required', 'unknown_event', 'invalid_state']
+              .includes(result.reason) ? result.reason : 'internal_error';
+            return kugouEventFailure(code);
+          }
+          return kugouEventResult({
+            outcome: 'acknowledged',
+            eventId: args.eventId,
+            acknowledged: true,
+            alreadyAcknowledged: result.alreadyAcknowledged,
+          }, result.alreadyAcknowledged ? '事件已确认，无需重复处理。' : '事件确认成功。');
+        }),
+      );
+    }
   }
 
   server.registerTool(
