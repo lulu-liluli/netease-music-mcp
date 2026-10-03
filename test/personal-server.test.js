@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { Agent as HttpAgent, request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -67,6 +67,19 @@ function parseMcpResponse(text, contentType) {
 
 async function readMcpResponse(response) {
   return parseMcpResponse(await response.text(), response.headers.get('content-type'));
+}
+
+function assertBearerFailure(response, payload, status = 401) {
+  assert.equal(response.status, status);
+  assert.equal(payload.error, status === 401 ? 'invalid_token' : 'insufficient_scope');
+  const challenge = response.headers.get('www-authenticate');
+  assert.match(challenge, /^Bearer /);
+  assert.ok(challenge.includes(`error="${payload.error}"`));
+  assert.ok(challenge.includes('scope="music:read"'));
+  assert.ok(challenge.includes(
+    `resource_metadata="${CANONICAL_ORIGIN}/.well-known/oauth-protected-resource/mcp"`,
+  ));
+  assert.match(challenge, /^[\x20-\x7e]+$/);
 }
 
 function mcpRequestBody(id, method = 'tools/list', params = {}) {
@@ -460,9 +473,186 @@ test('completes dynamic registration, PKCE authorization and MCP access', async 
     assert.equal(initialized.status, 200);
     const mcp = await readMcpResponse(initialized);
     assert.equal(mcp.result.serverInfo.name, 'netease-music-mcp');
+    assert.deepEqual((await store.verifyAccessToken(tokens.access_token, RESOURCE)).scopes, PERSONAL_SCOPES);
+    const refreshedResponse = await fetch(`${baseUrl}/oauth/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: client.client_id,
+        refresh_token: tokens.refresh_token,
+        resource: RESOURCE,
+      }),
+    });
+    assert.equal(refreshedResponse.status, 200);
+    const refreshed = await refreshedResponse.json();
+    assert.equal(refreshed.token_type, 'Bearer');
+    assert.equal(refreshed.scope, PERSONAL_SCOPES.join(' '));
+    assert.equal(refreshed.refresh_token === tokens.refresh_token, false);
+    for (const credential of [tokens.access_token, refreshed.access_token]) {
+      const listed = await postEventMcp(baseUrl, credential, 'tools/list', {});
+      assert.equal(listed.response.status, 200);
+      assert.equal(listed.result.tools.length, 16);
+    }
     assert.deepEqual(errors, []);
   });
 });
+
+for (const kind of ['unknown', 'revoked', 'expired', 'wrong audience']) {
+  test(`rejects ${kind} credentials with a sanitized 401 challenge before tool execution`, async (t) => {
+    const options = eventServerOptions({ controlEnabled: true });
+    const wait = t.mock.method(options.kugouEventQueue, 'waitNext');
+    const ack = t.mock.method(options.kugouEventQueue, 'ack');
+    const control = t.mock.method(options.kugouBridge, 'enqueueCommand');
+    const status = t.mock.method(options.kugouBridge, 'getStatus');
+    await withServer(async ({ baseUrl, store, errors }) => {
+      const valid = await eventAccessToken(store, PERSONAL_SCOPES);
+      const owner = await store.getOwner();
+      let credential = randomBytes(32).toString('base64url');
+      if (kind !== 'unknown') {
+        credential = (await store.createPersonalAccessToken(owner.id, {
+          label: 'rejected credential',
+          scopes: PERSONAL_SCOPES,
+          resource: kind === 'wrong audience' ? 'https://other.example.test/mcp' : RESOURCE,
+        })).token;
+      }
+      if (kind === 'revoked') await store.revokeToken(credential);
+      if (kind === 'expired') {
+        const data = JSON.parse(await readFile(store.filePath, 'utf8'));
+        const hash = createHash('sha256').update(credential).digest('hex');
+        data.accessTokens.find((entry) => entry.tokenHash === hash).expiresAt =
+          Math.floor(Date.now() / 1000) - 1;
+        await writeFile(store.filePath, JSON.stringify(data));
+      }
+      const before = await readFile(store.filePath, 'utf8');
+      const calls = [
+        ['kugou_status', {}],
+        ['kugou_control', { action: 'toggle' }],
+        ['kugou_wait', { timeout_ms: 1 }],
+        ['kugou_wait_ack', { eventId: 'unused', receiptToken: 'unused' }],
+      ];
+      for (const modern of [false, true]) {
+        for (const [name, args] of calls) {
+          const denied = await callEventMcp(baseUrl, credential, name, args, { modern });
+          assertBearerFailure(denied.response, denied.payload);
+          assert.equal(denied.payload.error_description, 'Invalid access token.');
+          assert.equal(denied.result, undefined);
+          const publicError = JSON.stringify({
+            body: denied.payload, challenge: denied.response.headers.get('www-authenticate'),
+          });
+          for (const secret of [credential, valid, DEVICE_TOKEN, store.filePath]) {
+            assert.equal(publicError.includes(secret), false);
+          }
+        }
+      }
+      const rest = await fetch(`${baseUrl}/api/v1/kugou/status`, {
+        headers: { authorization: `Bearer ${credential}` },
+      });
+      const restError = await rest.json();
+      assertBearerFailure(rest, restError);
+      assert.equal(restError.error_description, 'Invalid access token.');
+      assert.equal(JSON.stringify(restError).includes(credential), false);
+      assert.equal(wait.mock.callCount(), 0);
+      assert.equal(ack.mock.callCount(), 0);
+      assert.equal(control.mock.callCount(), 0);
+      assert.equal(status.mock.callCount(), 0);
+      const listed = await postEventMcp(baseUrl, valid, 'tools/list', {});
+      assert.equal(listed.response.status, 200);
+      assert.equal(listed.result.tools.length, 20);
+      assert.equal(await readFile(store.filePath, 'utf8'), before);
+      assert.deepEqual(errors, []);
+    }, options);
+  });
+}
+
+for (const kind of ['unavailable storage', 'invalid stored JSON', 'internal verifier error']) {
+  test(`keeps ${kind} as a sanitized 500 without an authentication challenge`, async (t) => {
+    await withServer(async ({ baseUrl, store, errors }) => {
+      const credential = await eventAccessToken(store, PERSONAL_SCOPES);
+      const raw = await readFile(store.filePath, 'utf8');
+      const privateDetail = `Invalid access token. private backend ${credential} ${DEVICE_TOKEN}`;
+      let restore;
+      if (kind === 'unavailable storage') {
+        const unavailablePath = `${store.filePath}.unavailable`;
+        await rename(store.filePath, unavailablePath);
+        restore = () => rename(unavailablePath, store.filePath);
+      } else if (kind === 'invalid stored JSON') {
+        await writeFile(store.filePath, `{"private_detail":"${privateDetail}`);
+        restore = () => writeFile(store.filePath, raw);
+      } else {
+        const verifier = t.mock.method(store, 'verifyAccessToken', () => {
+          throw new Error(privateDetail);
+        });
+        restore = () => verifier.mock.restore();
+      }
+      try {
+        const responses = [];
+        for (const modern of [false, true]) {
+          const denied = await postEventMcp(baseUrl, credential, 'tools/list', {}, { modern });
+          responses.push({ response: denied.response, payload: denied.payload });
+        }
+        const rest = await fetch(`${baseUrl}/api/v1/kugou/status`, {
+          headers: { authorization: `Bearer ${credential}` },
+        });
+        responses.push({ response: rest, payload: await rest.json() });
+        for (const { response, payload } of responses) {
+          assert.equal(response.status, 500);
+          assert.equal(response.headers.get('www-authenticate'), null);
+          assert.deepEqual(payload, {
+            error: 'server_error', error_description: 'Internal Server Error',
+          });
+          for (const secret of [credential, DEVICE_TOKEN, privateDetail, store.filePath, 'stack']) {
+            assert.equal(JSON.stringify(payload).includes(secret), false);
+          }
+        }
+      } finally {
+        await restore();
+      }
+      assert.equal((await postEventMcp(baseUrl, credential, 'tools/list', {})).response.status, 200);
+      assert.equal(await readFile(store.filePath, 'utf8'), raw);
+      assert.deepEqual(errors, []);
+    }, eventServerOptions());
+  });
+}
+
+for (const modern of [false, true]) {
+  test(`keeps full-scope tool discovery and all Kugou calls usable (${modern ? 'JSON' : 'SSE'})`, async () => {
+    const options = eventServerOptions({ controlEnabled: true });
+    await withServer(async ({ baseUrl, store, errors }) => {
+      const credential = await eventAccessToken(store, PERSONAL_SCOPES);
+      const before = await readFile(store.filePath, 'utf8');
+      const listed = await postEventMcp(baseUrl, credential, 'tools/list', {}, { modern });
+      assert.equal(listed.response.status, 200);
+      assert.equal(listed.result.tools.length, 20);
+      assert.deepEqual(listed.result.tools.filter((tool) => tool.name.startsWith('kugou_')).map((tool) => tool.name), [
+        'kugou_status', 'kugou_control', 'kugou_wait', 'kugou_wait_ack',
+      ]);
+      const playlistAuth = await callEventMcp(baseUrl, credential, 'netease_playlist_auth_status', {}, { modern });
+      assert.equal(playlistAuth.response.status, 200);
+      assert.equal(playlistAuth.result.isError, undefined);
+      await uploadKugouStatus(baseUrl, kugouPlaybackReport({ sequence: 1, title: 'Song A' }));
+      await uploadKugouStatus(baseUrl, kugouPlaybackReport({ sequence: 2, title: 'Song B' }));
+      const status = await callEventMcp(baseUrl, credential, 'kugou_status', {}, { modern });
+      assert.equal(status.response.status, 200);
+      assert.equal(status.result.isError, undefined);
+      assert.equal(JSON.parse(status.result.content[0].text).player.title, 'Song B');
+      const control = await callEventMcp(baseUrl, credential, 'kugou_control', { action: 'toggle' }, { modern });
+      assert.equal(control.response.status, 200);
+      assert.equal(control.result.isError, undefined);
+      assert.equal(JSON.parse(control.result.content[0].text).action, 'toggle');
+      const waiting = await callEventMcp(baseUrl, credential, 'kugou_wait', {}, { modern });
+      assert.equal(waiting.response.status, 200);
+      assert.equal(waiting.result.structuredContent.event.eventType, 'track_changed');
+      const ack = await ackMcpEvent(baseUrl, credential, waiting.result.structuredContent, { modern });
+      assert.equal(ack.response.status, 200);
+      assert.equal(ack.result.structuredContent.outcome, 'acknowledged');
+      const timeout = await callEventMcp(baseUrl, credential, 'kugou_wait', { timeout_ms: 1 }, { modern });
+      assert.deepEqual(timeout.result.structuredContent, { outcome: 'timeout' });
+      assert.equal(await readFile(store.filePath, 'utf8'), before);
+      assert.deepEqual(errors, []);
+    }, options);
+  });
+}
 
 test('fully streams MCP SSE responses and preserves HTTP keep-alive', async () => {
   await withServer(async ({ baseUrl, store, errors, instance }) => {
@@ -1547,21 +1737,13 @@ test('enforces entry Bearer authentication and read scope for both event tools',
     const token = await eventAccessToken(store, ['playlist:read']);
     for (const name of ['kugou_wait', 'kugou_wait_ack']) {
       const args = name === 'kugou_wait' ? { timeout_ms: 1 } : { eventId: 'x', receiptToken: 'x' };
-      for (const [unauthorizedToken, status] of [[null, 401], [DEVICE_TOKEN, 500]]) {
+      for (const unauthorizedToken of [null, DEVICE_TOKEN]) {
         const denied = await callEventMcp(baseUrl, unauthorizedToken, name, args);
-        assert.equal(denied.response.status, status);
-        if (status === 401) {
-          assert.match(denied.response.headers.get('www-authenticate'), /Bearer/);
-        } else {
-          // Existing store verifier throws a plain Error for an unknown token;
-          // the SDK maps that to server_error. Keep OAuth core behavior intact.
-          assert.equal(denied.payload.error, 'server_error');
-          assert.equal(JSON.stringify(denied.payload).includes(DEVICE_TOKEN), false);
-        }
+        assertBearerFailure(denied.response, denied.payload);
+        assert.equal(JSON.stringify(denied.payload).includes(DEVICE_TOKEN), false);
       }
       const forbidden = await callEventMcp(baseUrl, token, name, args);
-      assert.equal(forbidden.response.status, 403);
-      assert.match(forbidden.response.headers.get('www-authenticate'), /insufficient_scope/);
+      assertBearerFailure(forbidden.response, forbidden.payload, 403);
     }
     assert.equal(wait.mock.callCount(), 0);
     assert.equal(ack.mock.callCount(), 0);

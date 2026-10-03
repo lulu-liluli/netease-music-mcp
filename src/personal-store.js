@@ -8,6 +8,7 @@ import {
 } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { OAuthError, OAuthErrorCode } from '@modelcontextprotocol/server';
 
 const STORE_VERSION = 1;
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
@@ -487,7 +488,7 @@ export class PersonalAuthStore {
           safeEqualHex(item.tokenHash, digest(token)),
         );
         if (!entry || entry.resource !== resource || entry.expiresAt <= nowSeconds()) {
-          throw new Error('无效的访问令牌。');
+          throw new OAuthError(OAuthErrorCode.InvalidToken, 'Invalid access token.');
         }
         return {
           token,
